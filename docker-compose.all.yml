@@ -64,6 +64,21 @@ services:
       - goclaw-internal
     restart: unless-stopped
 
+  vnc:
+    image: dorowu/ubuntu-desktop-lxde-vnc
+    environment:
+      - RESOLUTION=1280x720x24
+      - VNC_PASSWORD=${VNC_PASSWORD:-goclaw}
+    ports:
+      - "6080:80"     # noVNC — mở browser vào đây để xem màn hình
+      - "5900:5900"   # VNC client
+    volumes:
+      - x11-socket:/tmp/.X11-unix
+    networks:
+      - goclaw-internal
+    shm_size: 512m
+    restart: unless-stopped
+
   goclaw:
     image: goclaw-claude:latest   # image local build có claude CLI
     pull_policy: never             # không pull từ registry, luôn dùng bản local
@@ -77,6 +92,8 @@ services:
         condition: service_healthy
       chrome-proxy:
         condition: service_started
+      vnc:
+        condition: service_started   # thêm dòng này
     ports:
       - "${GOCLAW_PORT:-18790}:18790"
     env_file:
@@ -93,12 +110,14 @@ services:
       - GOCLAW_BROWSER_REMOTE_URL=ws://chrome-proxy:9222
       # Dùng hostname goclaw-db thay vì postgres để tránh DNS conflict
       - GOCLAW_POSTGRES_DSN=postgres://${POSTGRES_USER:-goclaw}:${POSTGRES_PASSWORD:-goclaw}@goclaw-db:5432/${POSTGRES_DB:-goclaw}?sslmode=disable
+      - DISPLAY=:1   # kết nối vào X display của VNC container
     volumes:
       - goclaw-data:/app/data
       - goclaw-workspace:/app/workspace
       - goclaw-skills:/app/skills
       - goclaw-workspace:/app/.goclaw
       - /root/.claude:/app/.claude-host:ro
+      - x11-socket:/tmp/.X11-unix   # chia sẻ X11 socket
     extra_hosts:
       - "host.docker.internal:host-gateway"
     security_opt:
@@ -128,6 +147,7 @@ volumes:
   goclaw-workspace:
   postgres-data:
   goclaw-skills:
+  x11-socket:
 
 networks:
   goclaw-internal:
