@@ -1,0 +1,16 @@
+# Extend official goclaw image, thêm claude CLI vào
+# Không cần build từ source Go — chỉ cần file này + docker-compose.all.yml
+ARG VERSION=full
+FROM ghcr.io/nextlevelbuilder/goclaw:${VERSION}
+
+# Cài Node.js + claude CLI với quyền root tại build time
+USER root
+
+# Alpine: cài nodejs + npm, sau đó cài claude CLI
+RUN apk add --no-cache nodejs npm \
+    && npm install -g @anthropic-ai/claude-code \
+    && claude --version \
+    && echo "Claude CLI installed successfully"
+
+# Trở lại user goclaw (mặc định của image gốc)
+USER goclaw

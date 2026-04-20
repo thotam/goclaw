@@ -1,0 +1,94 @@
+# Merged từ: docker-compose.yml + docker-compose.postgres.yml + docker-compose.claude-cli.yml
+# Dùng cho aaPanel hoặc môi trường chỉ cần 1 file duy nhất.
+#
+# Khởi động:
+#   docker compose -f docker-compose.all.yml up -d
+#   # Dashboard: http://localhost:18790
+
+services:
+
+  # Đổi tên thành goclaw-db để tránh conflict DNS với postgres khác trên baota_net
+  goclaw-db:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-goclaw}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-goclaw}
+      POSTGRES_DB: ${POSTGRES_DB:-goclaw}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-goclaw} -d ${POSTGRES_DB:-goclaw}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - goclaw-internal   # chỉ nội bộ, không ra baota_net
+
+  goclaw:
+    image: goclaw-claude:latest   # image local build có claude CLI
+    pull_policy: never             # không pull từ registry, luôn dùng bản local
+    build:
+      context: .                   # chỉ cần Dockerfile.claude ở cùng thư mục
+      dockerfile: Dockerfile.claude
+      args:
+        VERSION: "${GOCLAW_VERSION:-full}"
+    depends_on:
+      goclaw-db:
+        condition: service_healthy
+    ports:
+      - "${GOCLAW_PORT:-18790}:18790"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - GOCLAW_HOST=0.0.0.0
+      - GOCLAW_PORT=18790
+      - GOCLAW_CONFIG=/app/data/config.json
+      - GOCLAW_GATEWAY_TOKEN=${GOCLAW_GATEWAY_TOKEN:-}
+      - GOCLAW_ENCRYPTION_KEY=${GOCLAW_ENCRYPTION_KEY:-}
+      - GOCLAW_SKILLS_DIR=/app/data/skills
+      - GOCLAW_TRACE_VERBOSE=${GOCLAW_TRACE_VERBOSE:-0}
+      # Dùng hostname goclaw-db thay vì postgres để tránh DNS conflict
+      - GOCLAW_POSTGRES_DSN=postgres://${POSTGRES_USER:-goclaw}:${POSTGRES_PASSWORD:-goclaw}@goclaw-db:5432/${POSTGRES_DB:-goclaw}?sslmode=disable
+    volumes:
+      - goclaw-data:/app/data
+      - goclaw-workspace:/app/workspace
+      - goclaw-skills:/app/skills
+      - goclaw-workspace:/app/.goclaw
+      - /root/.claude:/app/.claude-host:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '2.0'
+          pids: 200
+    networks:
+      - goclaw-internal   # giao tiếp với goclaw-db
+      - baota_net         # expose ra ngoài qua aaPanel
+    restart: unless-stopped
+
+volumes:
+  goclaw-data:
+  goclaw-workspace:
+  postgres-data:
+  goclaw-skills:
+
+networks:
+  goclaw-internal:
+    driver: bridge      # network nội bộ riêng, tránh conflict DNS
+  baota_net:
+    external: true
