@@ -19,6 +19,7 @@ type TableDef struct {
 	HasTenantID bool   // direct tenant_id column
 	ScopeColumn string // explicit filter column when not tenant_id (e.g. tenants.id)
 	ParentJoin  string // JOIN clause for tables without direct tenant_id
+	OrderBy     string // cột sắp xếp; mặc định "id" nếu để trống
 }
 
 // TenantTables returns all tenant-scoped tables in FK dependency order (parents first).
@@ -35,7 +36,7 @@ func TenantTables() []TableDef {
 		{Name: "agents", Tier: 2, HasTenantID: true},
 		{Name: "sessions", Tier: 2, HasTenantID: true},
 		{Name: "api_keys", Tier: 2, HasTenantID: true},
-		{Name: "config_secrets", Tier: 2, HasTenantID: true},
+		{Name: "config_secrets", Tier: 2, HasTenantID: true, OrderBy: "key, tenant_id"},
 		{Name: "skills", Tier: 2, HasTenantID: true},
 		{Name: "mcp_servers", Tier: 2, HasTenantID: true},
 		{Name: "secure_cli_binaries", Tier: 2, HasTenantID: true},
@@ -113,7 +114,12 @@ func (t TableDef) exportQuery() (string, error) {
 		return "", fmt.Errorf("table %s: no tenant filter defined", t.Name)
 	}
 
-	return fmt.Sprintf("SELECT * FROM %s WHERE %s = $1 ORDER BY id", t.Name, column), nil
+	// Dùng OrderBy tuỳ chỉnh nếu bảng không có cột id (ví dụ config_secrets)
+	orderBy := t.OrderBy
+	if orderBy == "" {
+		orderBy = "id"
+	}
+	return fmt.Sprintf("SELECT * FROM %s WHERE %s = $1 ORDER BY %s", t.Name, column, orderBy), nil
 }
 
 func (t TableDef) deleteQuery() (string, error) {
