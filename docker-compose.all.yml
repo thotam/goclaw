@@ -1,9 +1,11 @@
 # Merged từ: docker-compose.yml + docker-compose.postgres.yml + docker-compose.claude-cli.yml
+#             + docker-compose.browser.yml (headless Chrome sidecar)
 # Dùng cho aaPanel hoặc môi trường chỉ cần 1 file duy nhất.
 #
 # Khởi động:
 #   docker compose -f docker-compose.all.yml up -d
 #   # Dashboard: http://localhost:18790
+#   # CDP Chrome: ws://localhost:${CHROME_CDP_PORT:-9222}
 
 services:
 
@@ -25,6 +27,43 @@ services:
     networks:
       - goclaw-internal   # chỉ nội bộ, không ra baota_net
 
+  # Headless Chrome sidecar — phục vụ browser automation qua CDP (:9222)
+  chrome:
+    image: chromedp/headless-shell:latest
+    command:
+      - --no-sandbox
+      - --headless=new
+      - --remote-allow-origins=*
+      - --disable-gpu
+      - --disable-dev-shm-usage
+    ports:
+      - "${CHROME_CDP_PORT:-9222}:9222"
+    shm_size: 2gb
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9222"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+    networks:
+      - goclaw-internal   # giao tiếp nội bộ với goclaw
+    restart: unless-stopped
+
+  chrome-proxy:
+    image: nginx:alpine
+    depends_on:
+      chrome:
+        condition: service_healthy
+    volumes:
+      - ./nginx-chrome.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - goclaw-internal
+    restart: unless-stopped
+
   goclaw:
     image: goclaw-claude:latest   # image local build có claude CLI
     pull_policy: never             # không pull từ registry, luôn dùng bản local
@@ -36,6 +75,8 @@ services:
     depends_on:
       goclaw-db:
         condition: service_healthy
+      chrome-proxy:
+        condition: service_started
     ports:
       - "${GOCLAW_PORT:-18790}:18790"
     env_file:
@@ -49,6 +90,7 @@ services:
       - GOCLAW_ENCRYPTION_KEY=${GOCLAW_ENCRYPTION_KEY:-}
       - GOCLAW_SKILLS_DIR=/app/data/skills
       - GOCLAW_TRACE_VERBOSE=${GOCLAW_TRACE_VERBOSE:-0}
+      - GOCLAW_BROWSER_REMOTE_URL=ws://chrome-proxy:9222
       # Dùng hostname goclaw-db thay vì postgres để tránh DNS conflict
       - GOCLAW_POSTGRES_DSN=postgres://${POSTGRES_USER:-goclaw}:${POSTGRES_PASSWORD:-goclaw}@goclaw-db:5432/${POSTGRES_DB:-goclaw}?sslmode=disable
     volumes:
@@ -69,7 +111,7 @@ services:
       - SETGID
       - CHOWN
     tmpfs:
-      - /tmp:rw,noexec,nosuid,size=256m
+      - /tmp:rw,nosuid,size=256m
     deploy:
       resources:
         limits:
