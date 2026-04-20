@@ -3,14 +3,12 @@
 ARG VERSION=full
 FROM ghcr.io/nextlevelbuilder/goclaw:${VERSION}
 
-# Cài Node.js + claude CLI với quyền root tại build time
-USER root
-
-# Alpine: cài nodejs + npm, sau đó cài claude CLI
-RUN apk add --no-cache nodejs npm \
+# Thêm Alpine edge repo để lấy postgresql18-client (PG18, chưa có trên stable)
+# nodejs/npm đã có sẵn trong base image full — không cần cài lại
+RUN echo "@edge https://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories \
+    && apk add --no-cache postgresql18-client@edge \
+    && rm -rf /var/cache/apk/* \
     && npm install -g @anthropic-ai/claude-code \
     && claude --version \
     && echo "Claude CLI installed successfully"
 
-# Trở lại user goclaw (mặc định của image gốc)
-USER goclaw
