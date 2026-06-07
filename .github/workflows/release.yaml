@@ -289,6 +289,10 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           VERSION: v${{ needs.release.outputs.version }}
         run: |
+          if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+            echo "Discord webhook URL is not configured. Skipping notification."
+            exit 0
+          fi
           curl -fsSL -H "Content-Type: application/json" \
             -d "{
               \"embeds\": [{
