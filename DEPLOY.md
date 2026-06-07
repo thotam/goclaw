@@ -42,14 +42,14 @@ Stack bao gồm: **GoClaw + PostgreSQL (pgvector) + Headless Chrome + Chrome Pro
 
 ## Dockerfile.claude
 
-Image `goclaw-claude` được build từ `ghcr.io/nextlevelbuilder/goclaw:full`, bổ sung thêm:
+Image `goclaw-claude` được build từ `ghcr.io/thotam/goclaw:full`, bổ sung thêm:
 
 - `postgresql18-client` — psql CLI để debug DB
 - `xdotool`, `scrot`, `xdpyinfo` — công cụ X11/GUI automation
 - `@anthropic-ai/claude-code` — Claude CLI (`claude`)
 
 ```dockerfile
-FROM ghcr.io/nextlevelbuilder/goclaw:full
+FROM ghcr.io/thotam/goclaw:full
 RUN apk add postgresql18-client xdotool scrot xdpyinfo \
     && npm install -g @anthropic-ai/claude-code
 ```
@@ -135,7 +135,7 @@ docker compose down -v
 
 ```bash
 # 1. Pull base image mới nhất từ GitHub Container Registry
-docker pull ghcr.io/nextlevelbuilder/goclaw:full
+docker pull ghcr.io/thotam/goclaw:full
 
 # 2. Rebuild image local và restart
 docker compose up -d --build
