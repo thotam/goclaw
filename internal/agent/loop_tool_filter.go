@@ -15,11 +15,11 @@ var imageGenToolDef = providers.ToolDefinition{Type: "image_generation"}
 
 // buildFilteredTools resolves the per-iteration tool definitions based on policy,
 // disabled tools, bootstrap mode, skill visibility, channel type, and iteration budget.
-// Per-user MCP tools must be registered in the Registry before calling this function
-// (via getUserMCPTools) so they are included in policy filtering and execution.
+// extraTools are per-user tools (e.g. per-user MCP tools) that live outside the shared
+// registry; they are policy-filtered separately and appended to the output.
 // Returns tool definitions for the provider, an allowed-tools map for execution validation,
 // and the (potentially modified) messages slice when final-iteration stripping appends a hint.
-func (l *Loop) buildFilteredTools(req *RunRequest, hadBootstrap bool, iteration, maxIter int, messages []providers.Message) ([]providers.ToolDefinition, map[string]bool, []providers.Message) {
+func (l *Loop) buildFilteredTools(req *RunRequest, hadBootstrap bool, iteration, maxIter int, messages []providers.Message, extraTools []tools.Tool) ([]providers.ToolDefinition, map[string]bool, []providers.Message) {
 	// Build provider request with policy-filtered tools.
 	var toolDefs []providers.ToolDefinition
 	var allowedTools map[string]bool
@@ -117,6 +117,38 @@ func (l *Loop) buildFilteredTools(req *RunRequest, hadBootstrap bool, iteration,
 			Content: "[System] Final iteration reached. Summarize all findings and respond to the user now. No more tool calls allowed.",
 		})
 		return toolDefs, allowedTools, messages
+	}
+
+	// Append per-user extra tools (e.g. per-user MCP tools) after all registry-based
+	// filtering. These are already grant-filtered (IsToolAllowed per MCP server grant)
+	// but still need to pass the agent's general tool policy.
+	// orchMode deny and disabledTools are applied here too for consistency.
+	orchDeny := orchModeDenyTools(l.orchMode)
+	for _, t := range extraTools {
+		name := t.Name()
+		// Policy check: skip tools the agent's policy would deny/restrict.
+		if l.toolPolicy != nil && !l.toolPolicy.WouldAllow(name, l.provider.Name(), l.agentToolPolicy, req.ToolAllow) {
+			continue
+		}
+		// Orchestration mode deny.
+		if orchDeny[name] {
+			continue
+		}
+		// Tenant-disabled tools.
+		if l.disabledTools[name] {
+			continue
+		}
+		// Bootstrap mode: restrict to write_file only for open agents.
+		if hadBootstrap && l.agentType != store.AgentTypePredefined {
+			if !bootstrapToolAllowlist[name] {
+				continue
+			}
+		}
+		def := tools.ToProviderDef(t)
+		toolDefs = append(toolDefs, def)
+		if allowedTools != nil {
+			allowedTools[name] = true
+		}
 	}
 
 	// Two-tier image generation gate:
