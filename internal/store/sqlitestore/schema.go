@@ -16,7 +16,7 @@ var schemaSQL string
 
 // SchemaVersion is the current SQLite schema version.
 // Bump this when adding new migration steps below.
-const SchemaVersion = 42
+const SchemaVersion = 43
 
 // migrations maps version → SQL to apply when upgrading FROM that version.
 // schema.sql always represents the LATEST full schema (for fresh DBs).
@@ -772,6 +772,32 @@ CREATE INDEX IF NOT EXISTS idx_browser_cookies_expires_at
 	40: `ALTER TABLE secure_cli_user_credentials ADD COLUMN host_scope TEXT;`,
 	// Version 41 → 42: credential adapter framework — adapter_name on binaries.
 	41: `ALTER TABLE secure_cli_binaries ADD COLUMN adapter_name TEXT;`,
+	// Version 42 → 43: mcp_oauth_tokens table for MCP OAuth client support.
+	// Partial unique indexes instead of UNIQUE constraint — SQLite treats NULLs as
+	// distinct in UNIQUE constraints, so global tokens (user_id IS NULL) would not
+	// conflict and re-auth would insert duplicates instead of updating.
+	42: `CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
+    id                TEXT NOT NULL PRIMARY KEY,
+    server_id         TEXT NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
+    tenant_id         TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    user_id           TEXT,
+    access_token      TEXT NOT NULL,
+    refresh_token     TEXT,
+    token_type        TEXT NOT NULL DEFAULT 'Bearer',
+    scopes            TEXT,
+    expires_at        TEXT,
+    issued_at         TEXT,
+    dcr_client_id     TEXT NOT NULL DEFAULT '',
+    dcr_client_secret TEXT,
+    dcr_issuer        TEXT NOT NULL DEFAULT '',
+    token_endpoint    TEXT NOT NULL DEFAULT '',
+    resource_uri      TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS mcp_oauth_tokens_global_uq ON mcp_oauth_tokens (server_id, tenant_id) WHERE user_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS mcp_oauth_tokens_user_uq ON mcp_oauth_tokens (server_id, tenant_id, user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_server_tenant ON mcp_oauth_tokens (server_id, tenant_id);`,
 }
 
 // addHooksTables is the SQLite incremental migration for schema v19 → v20.

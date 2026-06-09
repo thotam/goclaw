@@ -14,6 +14,7 @@ type Stores struct {
 	Providers             ProviderStore
 	Tracing               TracingStore
 	MCP                   MCPServerStore
+	MCPOAuthTokens        MCPOAuthTokenStore
 	ChannelInstances      ChannelInstanceStore
 	ConfigSecrets         ConfigSecretsStore
 	AgentLinks            AgentLinkStore
