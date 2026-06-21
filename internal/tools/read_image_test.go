@@ -26,6 +26,22 @@ func TestReadImage_BothPathAndUrl_Error(t *testing.T) {
 	}
 }
 
+func TestReadImage_PrivateURL_Error(t *testing.T) {
+	tool := NewReadImageTool(nil)
+
+	res := tool.Execute(context.Background(), map[string]any{
+		"prompt": "describe this",
+		"url":    "http://127.0.0.1/image.png",
+	})
+
+	if !res.IsError {
+		t.Fatalf("expected error for private image URL")
+	}
+	if !strings.Contains(res.ForLLM, "Invalid image URL") {
+		t.Errorf("unexpected error message: %s", res.ForLLM)
+	}
+}
+
 func TestReadImage_AnthropicURL_Error(t *testing.T) {
 	tool := NewReadImageTool(nil)
 
@@ -33,7 +49,7 @@ func TestReadImage_AnthropicURL_Error(t *testing.T) {
 		"prompt": "describe this",
 		"images": []providers.ImageContent{
 			{
-				URL: "https://example.com/image.png",
+				URL: "https://93.184.216.34/image.png",
 			},
 		},
 	}

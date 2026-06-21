@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/nextlevelbuilder/goclaw/internal/security"
 )
 
 type mockCredentialProvider struct {
@@ -34,8 +36,27 @@ func TestReadVideo_BothMediaIdAndUrl_Error(t *testing.T) {
 	}
 }
 
+func TestReadVideo_PrivateURL_Error(t *testing.T) {
+	tool := NewReadVideoTool(nil, nil)
+
+	res := tool.Execute(context.Background(), map[string]any{
+		"prompt": "describe this video",
+		"url":    "http://127.0.0.1/video.mp4",
+	})
+
+	if !res.IsError {
+		t.Fatalf("expected error for private video URL")
+	}
+	if !strings.Contains(res.ForLLM, "Invalid video URL") {
+		t.Errorf("unexpected error message: %s", res.ForLLM)
+	}
+}
+
 func TestReadVideo_GeminiURL_Validation(t *testing.T) {
-	// 1. Trường hợp không có Content-Length (ContentLength <= 0)
+	security.SetAllowLoopbackForTest(true)
+	defer security.SetAllowLoopbackForTest(false)
+
+	// Missing Content-Length should fail before upload.
 	ts1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Transfer-Encoding", "chunked")
 		w.Write([]byte("chunked data mock video"))
@@ -59,7 +80,7 @@ func TestReadVideo_GeminiURL_Validation(t *testing.T) {
 		t.Errorf("unexpected error for missing Content-Length: %v", err)
 	}
 
-	// 2. Trường hợp Content-Length vượt quá 2 GB
+	// Content-Length over the Gemini File API limit should fail before upload.
 	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "2147483649") // 2GB + 1 byte
 		w.WriteHeader(http.StatusOK)
@@ -80,7 +101,7 @@ func TestReadVideo_GeminiURL_Validation(t *testing.T) {
 		t.Errorf("unexpected error for limit exceed: %v", err)
 	}
 
-	// 3. Trường hợp HTTP status code lỗi (ví dụ 404)
+	// Non-2xx status should be reported before upload.
 	ts3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))

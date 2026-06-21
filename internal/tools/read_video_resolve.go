@@ -5,12 +5,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/security"
 )
 
 // resolveVideoFile finds the video file path from context MediaRefs.
@@ -62,12 +64,19 @@ func (t *ReadVideoTool) resolveVideoFile(ctx context.Context, mediaID string) (p
 
 // callProvider dispatches video analysis to the appropriate provider API.
 // Gemini: uses File API (upload → poll → file_data in generateContent).
-// Others: falls back to base64 or URL in image_url (OpenRouter routes to Gemini which handles video).
+// Others: falls back to base64 or URL in video_url (OpenRouter routes to Gemini which handles video).
 func (t *ReadVideoTool) callProvider(ctx context.Context, cp credentialProvider, providerName, model string, params map[string]any) ([]byte, *providers.Usage, error) {
 	prompt := GetParamString(params, "prompt", "Analyze this video and describe its contents.")
 	data, _ := params["data"].([]byte)
 	videoURL, _ := params["url"].(string)
 	mime := GetParamString(params, "mime", "video/mp4")
+	pinnedIP, _ := params[videoURLPinnedIPParam].(net.IP)
+	if videoURL != "" && pinnedIP == nil {
+		var err error
+		if _, pinnedIP, err = security.Validate(videoURL); err != nil {
+			return nil, nil, fmt.Errorf("invalid video URL: %w", err)
+		}
+	}
 
 	// Gemini: use File API (requires credentials).
 	ptype := GetParamString(params, "_provider_type", providerTypeFromName(providerName))
@@ -87,18 +96,19 @@ func (t *ReadVideoTool) callProvider(ctx context.Context, cp credentialProvider,
 
 		if videoURL != "" {
 			slog.Info("read_video: streaming URL directly to Gemini File API", "provider", providerName, "model", model, "url", videoURL)
-			
+
 			// Send GET request to fetch the stream.
-			req, getErr := http.NewRequestWithContext(ctx, "GET", videoURL, nil)
+			reqCtx := security.WithPinnedIP(ctx, pinnedIP)
+			req, getErr := http.NewRequestWithContext(reqCtx, "GET", videoURL, nil)
 			if getErr != nil {
 				if reservation != nil {
 					reservation.Reconcile(ctx, nil, getErr)
 				}
 				return nil, nil, fmt.Errorf("failed to create GET request for video URL: %w", getErr)
 			}
-			
-			// No global Timeout on http.Client to allow piping large streams.
-			client := &http.Client{}
+
+			// Use the shared SSRF-safe client so DNS stays pinned during streaming.
+			client := security.NewSafeClient(0)
 			httpResp, getErr := client.Do(req)
 			if getErr != nil {
 				if reservation != nil {

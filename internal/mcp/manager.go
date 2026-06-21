@@ -241,13 +241,23 @@ func (m *Manager) resolveServerCredentials(ctx context.Context, info store.MCPAc
 		return nil
 	}
 
-	// Skip server if it requires per-user credentials and user has none
+	var contextCreds *store.MCPContextCredentials
+	if contextStore, ok := m.store.(store.MCPContextAdminStore); ok {
+		for _, scope := range store.ChannelContextScopeChainFromContext(ctx) {
+			if creds, _ := contextStore.GetContextCredentialsForScope(ctx, scope, srv.ID); creds != nil {
+				contextCreds = creds
+			}
+		}
+	}
+
+	// Skip server if it requires scoped/user credentials and none are present.
 	if requireUserCreds(srv.Settings) {
 		if userID == "" {
 			return nil
 		}
 		uc, _ := m.store.GetUserCredentials(ctx, srv.ID, userID)
-		if uc == nil || (uc.APIKey == "" && len(uc.Headers) == 0 && len(uc.Env) == 0) {
+		hasContextCreds := contextCreds != nil && (contextCreds.APIKey != "" || len(contextCreds.Headers) > 0 || len(contextCreds.Env) > 0)
+		if !hasContextCreds && (uc == nil || (uc.APIKey == "" && len(uc.Headers) == 0 && len(uc.Env) == 0)) {
 			slog.Debug("mcp.skip_no_user_credentials", "server", srv.Name, "user", userID)
 			return nil
 		}
@@ -271,6 +281,27 @@ func (m *Manager) resolveServerCredentials(ctx context.Context, info store.MCPAc
 			headers = make(map[string]string)
 		}
 		headers["Authorization"] = "Bearer " + srv.APIKey
+	}
+
+	if contextCreds != nil {
+		if contextCreds.APIKey != "" {
+			if headers == nil {
+				headers = make(map[string]string)
+			}
+			headers["Authorization"] = "Bearer " + contextCreds.APIKey
+		}
+		for k, v := range contextCreds.Headers {
+			if headers == nil {
+				headers = make(map[string]string)
+			}
+			headers[k] = v
+		}
+		for k, v := range contextCreds.Env {
+			if env == nil {
+				env = make(map[string]string)
+			}
+			env[k] = v
+		}
 	}
 
 	// Merge per-user credentials (user overrides server defaults)
@@ -324,12 +355,10 @@ func (m *Manager) resolveServerCredentials(ctx context.Context, info store.MCPAc
 
 	// Per-user credentials change connection params → can't share pool connection.
 	// Fall back to per-agent mode when user has custom credentials.
-	hasUserCreds := userID != "" && m.store != nil
-	if hasUserCreds {
+	hasUserCreds := contextCreds != nil && (contextCreds.APIKey != "" || len(contextCreds.Headers) > 0 || len(contextCreds.Env) > 0)
+	if userID != "" && m.store != nil {
 		if uc, _ := m.store.GetUserCredentials(ctx, srv.ID, userID); uc != nil && (uc.APIKey != "" || len(uc.Headers) > 0 || len(uc.Env) > 0) {
 			hasUserCreds = true
-		} else {
-			hasUserCreds = false
 		}
 	}
 

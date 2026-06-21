@@ -32,6 +32,13 @@ func (h *MCPHandler) handleTestConnection(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "transport")})
 		return
 	}
+	if err := mcpbridge.ValidateServerConfig(req.Transport, req.Command, req.Args, req.URL); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
 
 	// For an OAuth server, "test OAuth" means test with the OAuth token only:
 	// Authorization comes solely from the GLOBAL token — never from a body header

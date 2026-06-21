@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/security"
 	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
@@ -62,7 +63,7 @@ func (t *ReadImageTool) SetUsageCapService(svc *usagecaps.Service) {
 func (t *ReadImageTool) Name() string { return "read_image" }
 
 func (t *ReadImageTool) Description() string {
-	return "Analyze images using vision AI. Works with: (1) images sent by the user (<media:image> tags), (2) workspace/generated image files (pass a file path)."
+	return "Analyze images using vision AI. Works with images sent by the user, workspace/generated image files, or public HTTP/HTTPS image URLs."
 }
 
 func (t *ReadImageTool) Parameters() map[string]any {
@@ -111,6 +112,9 @@ func (t *ReadImageTool) Execute(ctx context.Context, args map[string]any) *Resul
 		}
 		images = fileImages
 	} else if imgURL != "" {
+		if _, _, err := security.Validate(imgURL); err != nil {
+			return ErrorResult(fmt.Sprintf("Invalid image URL: %v", err))
+		}
 		images = []providers.ImageContent{{
 			URL: imgURL,
 		}}
@@ -152,6 +156,15 @@ func (t *ReadImageTool) Execute(ctx context.Context, args map[string]any) *Resul
 func (t *ReadImageTool) callProvider(ctx context.Context, cp credentialProvider, providerName, model string, params map[string]any) ([]byte, *providers.Usage, error) {
 	prompt := GetParamString(params, "prompt", "Describe this image in detail.")
 	images, _ := params["images"].([]providers.ImageContent)
+
+	for _, img := range images {
+		if img.URL == "" {
+			continue
+		}
+		if _, _, err := security.Validate(img.URL); err != nil {
+			return nil, nil, fmt.Errorf("invalid image URL: %w", err)
+		}
+	}
 
 	// Anthropic Claude does not support URL references and requires base64-encoded image data.
 	if providerName == "anthropic" || providerName == "claude-cli" {

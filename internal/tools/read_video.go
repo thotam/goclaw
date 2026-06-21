@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/security"
 	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
@@ -31,6 +33,8 @@ func MediaVideoRefsFromCtx(ctx context.Context) []providers.MediaRef {
 
 // videoMaxBytes is the max file size for video analysis (100MB).
 const videoMaxBytes = 100 * 1024 * 1024
+
+const videoURLPinnedIPParam = "_pinned_ip"
 
 // videoProviderPriority is the order in which providers are tried for video analysis.
 // OpenAI excluded — no native video upload in chat completions.
@@ -101,13 +105,17 @@ func (t *ReadVideoTool) Execute(ctx context.Context, args map[string]any) *Resul
 
 	var data []byte
 	var videoMime string
+	var pinnedIP net.IP
 
 	if videoURL != "" {
-		// Infer MIME type from URL extension
-		ext := filepath.Ext(videoURL)
-		if idx := strings.Index(ext, "?"); idx != -1 {
-			ext = ext[:idx]
+		validatedURL, validatedIP, err := security.Validate(videoURL)
+		if err != nil {
+			return ErrorResult(fmt.Sprintf("Invalid video URL: %v", err))
 		}
+		pinnedIP = validatedIP
+
+		// Infer MIME type from URL extension
+		ext := filepath.Ext(validatedURL.Path)
 		videoMime = mimeFromVideoExt(ext)
 	} else {
 		videoPath, mime, err := t.resolveVideoFile(ctx, mediaID)
@@ -139,6 +147,9 @@ func (t *ReadVideoTool) Execute(ctx context.Context, args map[string]any) *Resul
 		chain[i].Params["data"] = data
 		chain[i].Params["url"] = videoURL
 		chain[i].Params["mime"] = videoMime
+		if pinnedIP != nil {
+			chain[i].Params[videoURLPinnedIPParam] = pinnedIP
+		}
 	}
 
 	chainResult, err := ExecuteWithChain(ctx, chain, t.registry, t.callProvider)
