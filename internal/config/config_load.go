@@ -379,6 +379,9 @@ func (c *Config) applyEnvOverrides() {
 	if c.Tools.Browser.RemoteURL != "" {
 		c.Tools.Browser.Enabled = true
 	}
+
+	// Cron job execution
+	envStr("GOCLAW_CRON_JOB_TIMEOUT", &c.Cron.JobTimeout)
 }
 
 // Save writes the config to a JSON file.
