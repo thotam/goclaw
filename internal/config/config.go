@@ -60,6 +60,7 @@ type Config struct {
 	Bindings  []AgentBinding  `json:"bindings,omitempty"`
 	Hooks     HooksConfig     `json:"hooks"`
 	Packages  PackagesConfig  `json:"packages"` // runtime package mgmt (GitHub updater)
+	Messages  SystemMsgConfig `json:"system_messages,omitempty"`
 	mu        sync.RWMutex
 }
 
@@ -82,6 +83,38 @@ type PackagesConfig struct {
 }
 
 // UpdatesCheckTTLDuration parses UpdatesCheckTTL returning 1h on empty/invalid.
+// SystemMsgConfig customizes operator-facing system messages that GoClaw
+// sends directly, outside normal LLM replies. Message templates use
+// {{variable}} placeholders and may be overridden per locale.
+type SystemMsgConfig struct {
+	DefaultLocale string                            `json:"default_locale,omitempty"`
+	Messages      map[string]LocalizedSystemMessage `json:"messages,omitempty"`
+}
+
+// LocalizedSystemMessage maps locale code ("en", "vi", "zh", "ko") to a
+// template override for one system message key.
+type LocalizedSystemMessage map[string]string
+
+// Clone returns a deep copy safe for snapshots and ReplaceFrom.
+func (s SystemMsgConfig) Clone() SystemMsgConfig {
+	out := SystemMsgConfig{DefaultLocale: strings.TrimSpace(s.DefaultLocale)}
+	if len(s.Messages) == 0 {
+		return out
+	}
+	out.Messages = make(map[string]LocalizedSystemMessage, len(s.Messages))
+	for key, byLocale := range s.Messages {
+		if len(byLocale) == 0 {
+			continue
+		}
+		cp := make(LocalizedSystemMessage, len(byLocale))
+		for locale, template := range byLocale {
+			cp[locale] = template
+		}
+		out.Messages[key] = cp
+	}
+	return out
+}
+
 func (p PackagesConfig) UpdatesCheckTTLDuration() time.Duration {
 	if p.UpdatesCheckTTL == "" {
 		return time.Hour
@@ -480,10 +513,15 @@ type CronConfig struct {
 	RetryMaxDelay   string `json:"retry_max_delay,omitempty"`  // maximum backoff delay (default "30s", Go duration)
 	DefaultTimezone string `json:"default_timezone,omitempty"` // IANA timezone for cron expressions when not set per-job (e.g. "Asia/Ho_Chi_Minh")
 	JobTimeout      string `json:"job_timeout,omitempty"`      // max duration per cron job execution (default "10m", Go duration)
+	CommandEnabled  bool   `json:"command_enabled,omitempty"`  // allow deterministic shell-command cron payloads (kind="command"). Default false. These run inside the gateway process with its privileges — enable only on trusted deployments.
+	CommandTimeout  string `json:"command_timeout,omitempty"`  // default per-command wall-clock timeout when a job sets none (default "5m", Go duration)
 }
 
 // DefaultJobTimeout is the fallback timeout for cron job execution.
 const DefaultJobTimeout = 10 * time.Minute
+
+// DefaultCommandTimeout is the fallback per-command timeout for command cron payloads.
+const DefaultCommandTimeout = 5 * time.Minute
 
 // JobTimeoutDuration returns the configured job timeout or the default (10m).
 func (cc CronConfig) JobTimeoutDuration() time.Duration {
@@ -495,6 +533,19 @@ func (cc CronConfig) JobTimeoutDuration() time.Duration {
 		slog.Warn("cron: invalid job_timeout, using default", "value", cc.JobTimeout, "default", DefaultJobTimeout)
 	}
 	return DefaultJobTimeout
+}
+
+// CommandTimeoutDuration returns the configured default per-command timeout or
+// the default (5m). A per-job timeoutSeconds, when set, overrides this.
+func (cc CronConfig) CommandTimeoutDuration() time.Duration {
+	if cc.CommandTimeout != "" {
+		d, err := time.ParseDuration(cc.CommandTimeout)
+		if err == nil && d > 0 {
+			return d
+		}
+		slog.Warn("cron: invalid command_timeout, using default", "value", cc.CommandTimeout, "default", DefaultCommandTimeout)
+	}
+	return DefaultCommandTimeout
 }
 
 // ToRetryConfig converts CronConfig to cron.RetryConfig with defaults applied.
@@ -565,6 +616,7 @@ func (c *Config) ReplaceFrom(src *Config) {
 	c.Telemetry = src.Telemetry
 	c.Tailscale = src.Tailscale
 	c.Bindings = src.Bindings
+	c.Messages = src.Messages.Clone()
 }
 
 // Clone returns a deep copy of the config while holding the read lock.
@@ -595,6 +647,14 @@ func (c *Config) ShellDenyGroupsSnapshot() map[string]bool {
 	groups := make(map[string]bool, len(c.Tools.ShellDenyGroups))
 	maps.Copy(groups, c.Tools.ShellDenyGroups)
 	return groups
+}
+
+// SystemMessagesSnapshot returns a deep copy of configured system-message
+// overrides without exposing mutable config state to long-lived channels.
+func (c *Config) SystemMessagesSnapshot() SystemMsgConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Messages.Clone()
 }
 
 // IdentityConfig defines agent persona / display identity.

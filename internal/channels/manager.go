@@ -11,6 +11,7 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 )
 
 // ChannelStream is the per-run streaming handle stored on RunContext.
@@ -54,7 +55,7 @@ type RunContext struct {
 	thinkingBuffer       string        // accumulated thinking/reasoning text
 	hasThinking          bool          // true if any thinking events received this iteration
 	thinkingDone         bool          // true after first chunk arrives (reasoning→answer transition complete)
-	tagParseSkipped      bool          // true after first chunk with no <think> tags (skip re-parsing)
+	tagParsePending      string        // raw trailing text withheld because it may be a split <think> tag
 	reasoningBubbles     *reasoningBubbleBuffer
 	reasoningBubbleTimer *time.Timer
 }
@@ -69,6 +70,7 @@ type Manager struct {
 	dispatchTask     *asyncTask
 	mu               sync.RWMutex
 	contactCollector *store.ContactCollector
+	systemMessages   *systemmessages.Resolver
 }
 
 type asyncTask struct {
@@ -196,11 +198,33 @@ func (m *Manager) RegisterChannel(name string, channel Channel) {
 			bc.SetContactCollector(m.contactCollector)
 		}
 	}
+	if m.systemMessages != nil {
+		if sm, ok := channel.(interface {
+			SetSystemMessages(*systemmessages.Resolver)
+		}); ok {
+			sm.SetSystemMessages(m.systemMessages)
+		}
+	}
 	m.channels[name] = channel
 	if hc, ok := channel.(interface{ MarkRegistered(string) }); ok {
 		hc.MarkRegistered("Configured")
 	}
 	m.syncChannelHealthLocked(name, channel)
+}
+
+// SetSystemMessages sets the resolver propagated to channels registered now and
+// in the future.
+func (m *Manager) SetSystemMessages(r *systemmessages.Resolver) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.systemMessages = r
+	for _, channel := range m.channels {
+		if sm, ok := channel.(interface {
+			SetSystemMessages(*systemmessages.Resolver)
+		}); ok {
+			sm.SetSystemMessages(r)
+		}
+	}
 }
 
 // RecordHealth stores runtime health for an instance, including failures before registration.
@@ -320,6 +344,22 @@ func (m *Manager) ListGroupMembers(ctx context.Context, channelName, chatID stri
 		return nil, fmt.Errorf("channel %q does not support listing group members", channelName)
 	}
 	return gmp.ListGroupMembers(ctx, chatID)
+}
+
+// ManageTelegram delegates a whitelisted Telegram management action to a
+// Telegram-capable channel instance.
+func (m *Manager) ManageTelegram(ctx context.Context, channelName string, req TelegramManagerRequest) (TelegramManagerResult, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return TelegramManagerResult{}, fmt.Errorf("channel %q not found", channelName)
+	}
+	mp, ok := ch.(TelegramManagerProvider)
+	if !ok {
+		return TelegramManagerResult{}, fmt.Errorf("channel %q does not support Telegram management", channelName)
+	}
+	return mp.ManageTelegram(ctx, req)
 }
 
 // UnregisterChannel removes a channel from the manager.

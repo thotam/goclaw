@@ -22,6 +22,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 )
 
 // PolicyResult is returned by BaseChannel policy checks.
@@ -214,6 +215,7 @@ type BaseChannel struct {
 
 	// Shared policy + pairing fields (set via setters after construction).
 	pairingService  store.PairingStore
+	systemMessages  *systemmessages.Resolver
 	groupHistory    *PendingHistory
 	historyLimit    int
 	approvedGroups  sync.Map // chatID → true (in-memory cache for paired group approval)
@@ -271,6 +273,17 @@ func (c *BaseChannel) SetPairingService(ps store.PairingStore) { c.pairingServic
 
 // PairingService returns the configured pairing store (may be nil).
 func (c *BaseChannel) PairingService() store.PairingStore { return c.pairingService }
+
+// SetSystemMessages sets the resolver used for operator/system messages.
+func (c *BaseChannel) SetSystemMessages(r *systemmessages.Resolver) { c.systemMessages = r }
+
+// SystemMessage renders a configurable operator/system message.
+func (c *BaseChannel) SystemMessage(locale, key string, vars systemmessages.Vars) string {
+	if c.systemMessages != nil {
+		return c.systemMessages.Render(locale, key, vars)
+	}
+	return systemmessages.Render(locale, key, vars)
+}
 
 // SetGroupHistory sets the pending group history tracker.
 func (c *BaseChannel) SetGroupHistory(gh *PendingHistory) { c.groupHistory = gh }
@@ -619,6 +632,17 @@ func (c *BaseChannel) ValidatePolicy(dmPolicy, groupPolicy string) {
 // This is the standard way for channels to forward received messages.
 // peerKind should be "direct" or "group" (see sessions.PeerDirect, sessions.PeerGroup).
 func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []string, metadata map[string]string, peerKind string) {
+	c.handleMessage(senderID, chatID, content, media, metadata, peerKind, false)
+}
+
+// HandleAuthorizedMessage publishes a message after the caller has already
+// enforced the channel policy. It preserves the default direct-message safety
+// net for adapters that do not have an explicit policy gate.
+func (c *BaseChannel) HandleAuthorizedMessage(senderID, chatID, content string, media []string, metadata map[string]string, peerKind string) {
+	c.handleMessage(senderID, chatID, content, media, metadata, peerKind, true)
+}
+
+func (c *BaseChannel) handleMessage(senderID, chatID, content string, media []string, metadata map[string]string, peerKind string, policyChecked bool) {
 	// Convert string paths to MediaFile (legacy path-only callers).
 	// Use filepath.Base(p) as filename so persistMedia's sanitizer gets a
 	// meaningful stem instead of falling back to UUID. MimeType is left empty —
@@ -627,7 +651,7 @@ func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []st
 	for _, p := range media {
 		mediaFiles = append(mediaFiles, bus.MediaFile{Path: p, Filename: filepath.Base(p)})
 	}
-	c.HandleMessageMedia(senderID, chatID, content, mediaFiles, metadata, peerKind)
+	c.handleMessageMedia(senderID, chatID, content, mediaFiles, metadata, peerKind, policyChecked)
 }
 
 // HandleMessageMedia is the richer sibling of HandleMessage: it accepts
@@ -637,12 +661,22 @@ func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []st
 // loses that information. Channels that already know the content type at
 // download time (e.g. Bitrix24 file events) should call this directly.
 func (c *BaseChannel) HandleMessageMedia(senderID, chatID, content string, media []bus.MediaFile, metadata map[string]string, peerKind string) {
+	c.handleMessageMedia(senderID, chatID, content, media, metadata, peerKind, false)
+}
+
+// HandleAuthorizedMessageMedia is the media-preserving variant for callers
+// that have already enforced the channel policy.
+func (c *BaseChannel) HandleAuthorizedMessageMedia(senderID, chatID, content string, media []bus.MediaFile, metadata map[string]string, peerKind string) {
+	c.handleMessageMedia(senderID, chatID, content, media, metadata, peerKind, true)
+}
+
+func (c *BaseChannel) handleMessageMedia(senderID, chatID, content string, media []bus.MediaFile, metadata map[string]string, peerKind string, policyChecked bool) {
 	// For DMs, enforce the allowlist as a safety net.
 	// For group messages, skip this check — group access is already enforced
 	// by the channel-specific group policy (checkGroupPolicy / CheckPolicy).
 	// Re-checking the sender here would incorrectly block users who are not
 	// individually listed but are in an allowed (or open-policy) group.
-	if peerKind != "group" && !c.IsAllowed(senderID) {
+	if peerKind != "group" && !policyChecked && !c.IsAllowed(senderID) {
 		return
 	}
 
@@ -678,6 +712,41 @@ type GroupMember struct {
 // GroupMemberProvider is optionally implemented by channels that can list group members.
 type GroupMemberProvider interface {
 	ListGroupMembers(ctx context.Context, chatID string) ([]GroupMember, error)
+}
+
+// TelegramManagerRequest describes a whitelisted Telegram Bot API management
+// action requested by the agent-facing telegram_manager tool.
+type TelegramManagerRequest struct {
+	Action              string         `json:"action"`
+	ChatID              string         `json:"chat_id,omitempty"`
+	MessageThreadID     int            `json:"message_thread_id,omitempty"`
+	MessageID           int            `json:"message_id,omitempty"`
+	UserID              int64          `json:"user_id,omitempty"`
+	Name                string         `json:"name,omitempty"`
+	Text                string         `json:"text,omitempty"`
+	InviteLink          string         `json:"invite_link,omitempty"`
+	IconColor           int            `json:"icon_color,omitempty"`
+	IconCustomEmojiID   string         `json:"icon_custom_emoji_id,omitempty"`
+	ExpireDate          int64          `json:"expire_date,omitempty"`
+	MemberLimit         int            `json:"member_limit,omitempty"`
+	DisableNotification bool           `json:"disable_notification,omitempty"`
+	CreatesJoinRequest  bool           `json:"creates_join_request,omitempty"`
+	OnlyIfBanned        bool           `json:"only_if_banned,omitempty"`
+	RevokeMessages      bool           `json:"revoke_messages,omitempty"`
+	Params              map[string]any `json:"params,omitempty"`
+}
+
+// TelegramManagerResult is a normalized response returned by Telegram-capable
+// channels after executing a whitelisted management action.
+type TelegramManagerResult struct {
+	Action string         `json:"action"`
+	Result map[string]any `json:"result,omitempty"`
+}
+
+// TelegramManagerProvider is optionally implemented by channels that expose
+// Telegram Bot API management actions through the channel manager.
+type TelegramManagerProvider interface {
+	ManageTelegram(ctx context.Context, req TelegramManagerRequest) (TelegramManagerResult, error)
 }
 
 // PendingCompactable is optionally implemented by channels that have a PendingHistory

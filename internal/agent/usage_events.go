@@ -77,6 +77,8 @@ func (l *Loop) recordToolUsageEvent(ctx context.Context, req *RunRequest, canoni
 	event := l.baseUsageEvent(ctx, req, start, eventType, resourceType, resourceName, resourceID, source)
 	event.SpanID = uuidPtr(spanID)
 	event.Status = "completed"
+	event.Provider = result.Provider
+	event.Model = result.Model
 	if result.IsError {
 		event.Status = "error"
 		event.ErrorCount = 1
@@ -86,12 +88,17 @@ func (l *Loop) recordToolUsageEvent(ctx context.Context, req *RunRequest, canoni
 		event.InputTokens = int64(result.Usage.PromptTokens)
 		event.OutputTokens = int64(result.Usage.CompletionTokens)
 		event.TotalTokens = int64(result.Usage.TotalTokens)
+		event.CacheReadTokens = int64(result.Usage.CacheReadTokens)
+		event.CacheCreateTokens = int64(result.Usage.CacheCreationTokens)
+		event.ThinkingTokens = int64(result.Usage.ThinkingTokens)
 		if event.TotalTokens == 0 {
 			event.TotalTokens = event.InputTokens + event.OutputTokens
 		}
+		if result.Usage.PromptTokensIncludeCachedSegments {
+			metadata["prompt_tokens_include_cached_segments"] = true
+		}
+		event.CostUSD = l.calculateLLMCost(ctx, event.Provider, event.Model, result.Usage)
 	}
-	event.Provider = result.Provider
-	event.Model = result.Model
 	event.Metadata = usageMetadata(metadata)
 	l.insertUsageEventBestEffort(ctx, event)
 }

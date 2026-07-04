@@ -32,6 +32,7 @@ func wireExtraTools(
 	agentCfg config.AgentDefaults,
 	globalSkillsDir string,
 	builtinSkillsDir string,
+	cronCommandEnabled bool,
 ) (heartbeatTool *tools.HeartbeatTool, hasMemory bool) {
 	// web_search: tenant-scoped resolve requires stores + msgBus — register here.
 	toolsReg.Register(tools.NewWebSearchTool(pgStores.ConfigSecrets, msgBus))
@@ -44,6 +45,7 @@ func wireExtraTools(
 	// Cron tool (agent-facing)
 	cronTool := tools.NewCronTool(pgStores.Cron)
 	cronTool.SetProviderStore(pgStores.Providers)
+	cronTool.SetCommandEnabled(cronCommandEnabled)
 	toolsReg.Register(cronTool)
 	slog.Info("cron tool registered")
 
@@ -65,7 +67,11 @@ func wireExtraTools(
 	toolsReg.Register(tools.NewSendFileTool(workspace, agentCfg.RestrictToWorkspace))
 	// Group members tool (list members in group chats)
 	toolsReg.Register(tools.NewListGroupMembersTool())
-	slog.Info("session + message + send_file tools registered")
+	// Telegram manager tool (admin/forum/message management; gated by tool policy)
+	// create_forum_topic is kept as a backward-compatible wrapper for topic.create.
+	toolsReg.Register(tools.NewCreateForumTopicTool(nil))
+	toolsReg.Register(tools.NewTelegramManagerTool())
+	slog.Info("session + message + send_file + telegram_manager tools registered")
 
 	// Register legacy tool aliases (backward-compat names from policy.go).
 	for alias, canonical := range tools.LegacyToolAliases() {

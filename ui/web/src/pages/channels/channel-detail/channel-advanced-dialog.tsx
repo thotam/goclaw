@@ -11,7 +11,11 @@ import {
 import { ConfigGroupHeader } from "@/components/shared/config-group-header";
 import { ChannelFields } from "../channel-fields";
 import { configSchema } from "../channel-schemas";
-import { normalizeReasoningDeliveryConfig } from "../reasoning-delivery-config";
+import {
+  buildAdvancedConfigUpdate,
+  deriveAdvancedInitialValues,
+  ESSENTIAL_CONFIG_KEYS,
+} from "./channel-advanced-config";
 import type { ChannelInstanceData } from "@/types/channel";
 
 interface ChannelAdvancedDialogProps {
@@ -21,15 +25,14 @@ interface ChannelAdvancedDialogProps {
   onUpdate: (updates: Record<string, unknown>) => Promise<void>;
 }
 
-const ESSENTIAL_CONFIG_KEYS = new Set(["dm_policy", "group_policy", "require_mention", "mention_mode"]);
-
 const NETWORK_KEYS = new Set(["api_server", "proxy", "domain", "connection_mode", "webhook_port", "webhook_path", "webhook_url"]);
 const LIMITS_KEYS = new Set(["history_limit", "media_max_mb", "text_chunk_limit"]);
 const STREAMING_KEYS = new Set(["dm_stream", "group_stream", "draft_transport", "reasoning_delivery", "native_stream", "debounce_delay", "thread_ttl"]);
 const BEHAVIOR_KEYS = new Set(["reaction_level", "link_preview", "render_mode", "topic_session_mode"]);
 const ACCESS_KEYS = new Set(["allow_from", "group_allow_from"]);
+const TELEGRAM_MANAGEMENT_KEYS = new Set(["telegram_manager.enabled", "telegram_manager.allowed_actions"]);
 
-function getAdvancedFields(channelType: string) {
+export function getAdvancedFields(channelType: string) {
   const allFields = configSchema[channelType] ?? [];
   const advanced = allFields.filter((f) => !ESSENTIAL_CONFIG_KEYS.has(f.key));
   return {
@@ -38,15 +41,8 @@ function getAdvancedFields(channelType: string) {
     streaming: advanced.filter((f) => STREAMING_KEYS.has(f.key)),
     behavior: advanced.filter((f) => BEHAVIOR_KEYS.has(f.key) || f.key.startsWith("chat_behavior.")),
     access: advanced.filter((f) => ACCESS_KEYS.has(f.key)),
+    telegramManagement: advanced.filter((f) => TELEGRAM_MANAGEMENT_KEYS.has(f.key)),
   };
-}
-
-function deriveInitialValues(instance: ChannelInstanceData): Record<string, unknown> {
-  const config = normalizeReasoningDeliveryConfig((instance.config ?? {}) as Record<string, unknown>);
-  // Only keep advanced keys (exclude essential + groups)
-  return Object.fromEntries(
-    Object.entries(config).filter(([k]) => !ESSENTIAL_CONFIG_KEYS.has(k) && k !== "groups"),
-  );
 }
 
 export function ChannelAdvancedDialog({
@@ -58,14 +54,13 @@ export function ChannelAdvancedDialog({
   const { t } = useTranslation("channels");
   const groups = getAdvancedFields(instance.channel_type);
 
-  const [values, setValues] = useState<Record<string, unknown>>(() => deriveInitialValues(instance));
+  const [values, setValues] = useState<Record<string, unknown>>(() => deriveAdvancedInitialValues(instance.config));
   const [saving, setSaving] = useState(false);
 
   // Re-sync local state when dialog opens
   useEffect(() => {
     if (!open) return;
-    setValues(deriveInitialValues(instance));
-     
+    setValues(deriveAdvancedInitialValues(instance.config));
   }, [open, instance]);
 
   const handleChange = useCallback((key: string, value: unknown) => {
@@ -75,13 +70,7 @@ export function ChannelAdvancedDialog({
   const handleSave = async () => {
     setSaving(true);
     try {
-      const existingConfig = (instance.config ?? {}) as Record<string, unknown>;
-      const cleanAdvanced = Object.fromEntries(
-        Object.entries(values).filter(([, v]) => v !== undefined && v !== "" && v !== null),
-      );
-      // Merge: preserve essential keys and groups from existing, overwrite advanced keys
-      const merged = normalizeReasoningDeliveryConfig({ ...existingConfig, ...cleanAdvanced });
-      await onUpdate({ config: merged });
+      await onUpdate({ config: buildAdvancedConfigUpdate(instance.config, values) });
       onOpenChange(false);
     } catch { // toast shown by hook
     } finally {
@@ -179,6 +168,21 @@ export function ChannelAdvancedDialog({
                 values={values}
                 onChange={handleChange}
                 idPrefix="adv-acc"
+              />
+            </>
+          )}
+
+          {groups.telegramManagement.length > 0 && (
+            <>
+              <ConfigGroupHeader
+                title={t("detail.telegramManagement")}
+                description={t("detail.telegramManagementDesc")}
+              />
+              <ChannelFields
+                fields={groups.telegramManagement}
+                values={values}
+                onChange={handleChange}
+                idPrefix="adv-tgm"
               />
             </>
           )}

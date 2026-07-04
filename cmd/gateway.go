@@ -48,8 +48,10 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/security"
 	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
+	usagepricing "github.com/nextlevelbuilder/goclaw/internal/usage/pricing"
 	"github.com/nextlevelbuilder/goclaw/internal/vault"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 
@@ -74,6 +76,100 @@ func gatewayLogOutput() io.Writer {
 	}
 	fmt.Fprintf(os.Stderr, "logging to %s\n", logFile)
 	return io.MultiWriter(os.Stdout, f)
+}
+
+type traceCostBackfiller interface {
+	BackfillLLMCosts(context.Context) (store.TraceCostBackfillStats, error)
+}
+
+type traceUsageAggregateReconciler interface {
+	ReconcileTraceUsageAggregates(context.Context) (store.TraceUsageAggregateStats, error)
+}
+
+type usageEventCostBackfiller interface {
+	BackfillUsageEventCosts(context.Context) (store.UsageEventCostBackfillStats, error)
+}
+
+type snapshotCostBackfiller interface {
+	BackfillSnapshotCosts(context.Context) (store.SnapshotCostBackfillStats, error)
+}
+
+type snapshotBucketRefresher interface {
+	RefreshBuckets(context.Context, []time.Time) (int, error)
+}
+
+func backfillTraceCostsAfterPricingSync(ctx context.Context, stores *store.Stores, snapshots snapshotBucketRefresher) {
+	if stores == nil {
+		return
+	}
+	backfillCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	if stores.Tracing != nil {
+		backfiller, ok := stores.Tracing.(traceCostBackfiller)
+		if ok {
+			stats, err := backfiller.BackfillLLMCosts(backfillCtx)
+			if err != nil {
+				slog.Warn("usage_pricing.trace_cost_backfill_failed", "error", err)
+			} else {
+				refreshedBuckets := 0
+				if snapshots != nil && len(stats.SnapshotBuckets) > 0 {
+					refreshedBuckets, err = snapshots.RefreshBuckets(backfillCtx, stats.SnapshotBuckets)
+					if err != nil {
+						slog.Warn("usage_pricing.trace_cost_snapshot_refresh_failed", "error", err, "buckets", len(stats.SnapshotBuckets))
+					}
+				}
+				if stats.SpanRowsUpdated > 0 || stats.TraceRowsUpdated > 0 || refreshedBuckets > 0 {
+					slog.Info("usage_pricing.trace_cost_backfill_complete",
+						"spans", stats.SpanRowsUpdated,
+						"traces", stats.TraceRowsUpdated,
+						"snapshot_buckets", refreshedBuckets,
+					)
+				}
+			}
+		}
+	}
+
+	if stores.Tracing != nil {
+		reconciler, ok := stores.Tracing.(traceUsageAggregateReconciler)
+		if ok {
+			stats, err := reconciler.ReconcileTraceUsageAggregates(backfillCtx)
+			if err != nil {
+				slog.Warn("usage_pricing.trace_usage_aggregate_reconcile_failed", "error", err)
+			} else if stats.TraceRowsUpdated > 0 {
+				slog.Info("usage_pricing.trace_usage_aggregate_reconcile_complete", "traces", stats.TraceRowsUpdated)
+			}
+		}
+	}
+
+	if stores.Snapshots != nil {
+		backfiller, ok := stores.Snapshots.(snapshotCostBackfiller)
+		if ok {
+			stats, err := backfiller.BackfillSnapshotCosts(backfillCtx)
+			if err != nil {
+				slog.Warn("usage_pricing.snapshot_cost_backfill_failed", "error", err)
+			} else if stats.SnapshotRowsUpdated > 0 {
+				slog.Info("usage_pricing.snapshot_cost_backfill_complete", "snapshots", stats.SnapshotRowsUpdated)
+			}
+		}
+	}
+
+	if stores.UsageEvents != nil {
+		backfiller, ok := stores.UsageEvents.(usageEventCostBackfiller)
+		if ok {
+			stats, err := backfiller.BackfillUsageEventCosts(backfillCtx)
+			if err != nil {
+				slog.Warn("usage_pricing.usage_event_cost_backfill_failed", "error", err)
+				return
+			}
+			if stats.EventRowsUpdated > 0 || len(stats.RollupBuckets) > 0 {
+				slog.Info("usage_pricing.usage_event_cost_backfill_complete",
+					"events", stats.EventRowsUpdated,
+					"rollup_buckets", len(stats.RollupBuckets),
+				)
+			}
+		}
+	}
 }
 
 func runGateway() {
@@ -167,7 +263,9 @@ func runGateway() {
 		tools.DetectServerIPs(context.Background())
 	}
 
+	slog.Debug("creating mcpMgr via setupToolRegistry")
 	toolsReg, execApprovalMgr, mcpMgr, sandboxMgr, browserMgr, webFetchTool, ttsTool, audioMgr, permPE, toolPE, dataDir, agentCfg := setupToolRegistry(cfg, workspace, providerRegistry)
+	slog.Debug("setupToolRegistry completed", "mcpMgr_nil", mcpMgr == nil)
 	if browserMgr != nil {
 		defer browserMgr.Close()
 	}
@@ -251,6 +349,29 @@ func runGateway() {
 		applyUserAllowedPaths(toolsReg, paths)
 		slog.Info("filesystem allowed paths reapplied from system_configs", "paths", len(paths))
 	}
+	// MCP servers: load from database (single source of truth).
+	// pgStores.MCP is nil on SQLite/desktop builds that don't support MCP tables.
+	// Apply store to MCP manager so ListToolsForAgent can query DB.
+	// mcpMgr is created before pgStores is available, so the store must be set here.
+	if pgStores.MCP != nil && mcpMgr != nil {
+		mcpMgr.SetStore(pgStores.MCP)
+		slog.Info("applied store to MCPManager")
+	}
+	slog.Debug("checking MCP store availability", "pgStores_MCP_nil", pgStores == nil || pgStores.MCP == nil, "mcpMgr_nil", mcpMgr == nil)
+	if pgStores.MCP != nil {
+		slog.Debug("initializing MCP from database")
+		if err := initMCPFromDB(context.Background(), mcpMgr, pgStores.MCP); err != nil {
+			slog.Warn("mcp.db_load_errors", "error", err)
+		} else {
+			slog.Debug("initMCPFromDB completed successfully")
+		}
+		if mcpMgr != nil {
+			slog.Info("MCP manager started", "tools", len(mcpMgr.ToolNames()))
+		}
+	} else {
+		slog.Debug("skipping MCP database init: pgStores.MCP is nil")
+	}
+
 	setupMemoryEmbeddings(pgStores, providerRegistry)
 	usageCapSvc := usagecaps.NewService(pgStores.UsageCaps, pgStores.Providers)
 
@@ -346,7 +467,7 @@ func runGateway() {
 	_ = skillSearchTool // used via wireExtras → skillsLoader; kept for type clarity
 
 	// Register cron/heartbeat/session/message tools, aliases, allow-paths, store wiring.
-	heartbeatTool, hasMemory := wireExtraTools(pgStores, toolsReg, msgBus, workspace, dataDir, agentCfg, globalSkillsDir, builtinSkillsDir)
+	heartbeatTool, hasMemory := wireExtraTools(pgStores, toolsReg, msgBus, workspace, dataDir, agentCfg, globalSkillsDir, builtinSkillsDir, cfg.Cron.CommandEnabled)
 
 	// Register workstation_exec + claude_remote tools (Standard edition only; deny-all until Phase 6).
 	// cleanupWorkstation stops the activity sink retention goroutine and drains the write buffer.
@@ -365,6 +486,7 @@ func runGateway() {
 	server.SetVersion(Version)
 	server.SetDB(pgStores.DB)
 	server.SetPolicyEngine(permPE)
+	server.SetToolPolicy(toolPE)
 	server.SetPairingService(pgStores.Pairing)
 	server.SetMessageBus(msgBus)
 	server.SetOAuthHandler(httpapi.NewOAuthHandler(pgStores.Providers, pgStores.ConfigSecrets, providerRegistry, msgBus))
@@ -427,11 +549,17 @@ func runGateway() {
 	// Wire dependencies for system prompt preview parity.
 	if agentsH != nil {
 		agentsH.SetPreviewDeps(toolsReg, skillsLoader)
+		agentsH.SetPreviewToolPolicy(toolPE)
 		var skillAccess store.SkillAccessStore
 		if pgStores.Skills != nil {
 			skillAccess, _ = pgStores.Skills.(store.SkillAccessStore)
 		}
 		agentsH.SetPreviewStores(pgStores.Teams, pgStores.AgentLinks, skillAccess)
+		slog.Debug("wiring MCP preview manager", "mcpMgr_nil", mcpMgr == nil)
+		if mcpMgr != nil {
+			agentsH.SetPreviewMCPManager(httpapi.NewMCPPreviewAdapter(mcpMgr))
+			slog.Debug("set MCP preview manager on agentsH")
+		}
 	}
 
 	// External wake/trigger API
@@ -449,12 +577,12 @@ func runGateway() {
 			oauthRefresher = r
 		}
 		mcpOAuthH = httpapi.NewMCPOAuthHandler(httpapi.MCPOAuthHandlerDeps{
-			MCPStore:   pgStores.MCP,
-			OAuthStore: pgStores.MCPOAuthTokens,
-			Discoverer: mcpoauth.NewDiscoverer(safeHTTPClient),
-			FlowMgr:    mcpoauth.NewFlowManager(safeHTTPClient),
-			Refresher:  oauthRefresher,
-			EventBus:   msgBus,
+			MCPStore:    pgStores.MCP,
+			OAuthStore:  pgStores.MCPOAuthTokens,
+			Discoverer:  mcpoauth.NewDiscoverer(safeHTTPClient),
+			FlowMgr:     mcpoauth.NewFlowManager(safeHTTPClient),
+			Refresher:   oauthRefresher,
+			EventBus:    msgBus,
 			PublicURL:   cfg.Gateway.PublicURL,
 			Port:        cfg.Gateway.Port,
 			TenantStore: pgStores.Tenants,
@@ -511,7 +639,7 @@ func runGateway() {
 	// Register all RPC methods
 	server.SetLogTee(logTee)
 	server.SetRuntimeLogsHandler(httpapi.NewRuntimeLogsHandler(logTee))
-	pairingMethods, heartbeatMethods, chatMethods, cfgPermsMethods := registerAllMethods(server, agentRouter, pgStores.Sessions, pgStores.RunTimeline, pgStores.Cron, pgStores.Pairing, cfg, cfgPath, workspace, dataDir, msgBus, execApprovalMgr, pgStores.Agents, pgStores.Skills, pgStores.ConfigSecrets, pgStores.Teams, contextFileInterceptor, logTee, pgStores.Heartbeats, pgStores.ConfigPermissions, pgStores.SystemConfigs, pgStores.Tenants, pgStores.SkillTenantCfgs, audioMgr, usageCapSvc)
+	pairingMethods, heartbeatMethods, chatMethods, cfgPermsMethods := registerAllMethods(server, agentRouter, pgStores.Sessions, pgStores.Tracing, pgStores.RunTimeline, pgStores.Cron, pgStores.Pairing, cfg, cfgPath, workspace, dataDir, msgBus, execApprovalMgr, pgStores.Agents, pgStores.Skills, pgStores.ConfigSecrets, pgStores.Teams, contextFileInterceptor, logTee, pgStores.Heartbeats, pgStores.ConfigPermissions, pgStores.SystemConfigs, pgStores.Tenants, pgStores.SkillTenantCfgs, audioMgr, usageCapSvc, providerRegistry)
 
 	// Phase 3: Agent hooks RPC methods (hooks.list/create/update/delete/toggle/test/history).
 	if hs, ok := pgStores.Hooks.(hooks.HookStore); ok && hs != nil {
@@ -562,6 +690,7 @@ func runGateway() {
 
 	// Channel manager
 	channelMgr := channels.NewManager(msgBus)
+	channelMgr.SetSystemMessages(systemmessages.NewResolver(cfg))
 	deps.channelMgr = channelMgr
 
 	// Wire channel member resolver into permission grant paths (WS + HTTP) so
@@ -588,6 +717,14 @@ func runGateway() {
 	if t, ok := toolsReg.Get("list_group_members"); ok {
 		if gl, ok := t.(tools.GroupMemberListerAware); ok {
 			gl.SetGroupMemberLister(channelMgr.ListGroupMembers)
+		}
+	}
+	// Wire Telegram manager on telegram_manager tool.
+	for _, toolName := range []string{"telegram_manager", "create_forum_topic"} {
+		if t, ok := toolsReg.Get(toolName); ok {
+			if tm, ok := t.(tools.TelegramManagerAware); ok {
+				tm.SetTelegramManager(channelMgr.ManageTelegram)
+			}
 		}
 	}
 
@@ -692,6 +829,10 @@ func runGateway() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	go backfillTraceCostsAfterPricingSync(ctx, pgStores, snapshotWorker)
+	usagepricing.StartOpenRouterCatalogAutoSync(ctx, pgStores.UsageCaps, usagepricing.DefaultOpenRouterCatalogSyncInterval, func(syncCtx context.Context, _ int) {
+		backfillTraceCostsAfterPricingSync(syncCtx, pgStores, snapshotWorker)
+	})
 	server.StartUpdateChecker(ctx)
 
 	sigCh := make(chan os.Signal, 1)

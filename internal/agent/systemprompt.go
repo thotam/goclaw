@@ -383,11 +383,17 @@ func BuildSystemPrompt(cfg SystemPromptConfig) string {
 	}
 
 	// 4. ## Skills — full + task (pinned skills use hybrid section)
-	if (isFull || isTask) && !cfg.IsBootstrap && (cfg.SkillsSummary != "" || cfg.HasSkillSearch || cfg.HasSkillManage || cfg.PinnedSkillsSummary != "") {
-		if cfg.PinnedSkillsSummary != "" {
-			// Hybrid mode: pinned skills inline + search for rest
-			lines = append(lines, buildSkillsHybridSection(cfg.PinnedSkillsSummary, cfg.HasSkillSearch, isFull && cfg.HasSkillManage)...)
-		} else if isTask {
+	// Pinned skills must always be inlined, even on bootstrap turns — only the
+	// search/manage guidance and non-pinned skill summary are suppressed then.
+	switch {
+	case (isFull || isTask) && cfg.PinnedSkillsSummary != "" && cfg.IsBootstrap:
+		// Bootstrap: pinned skills only, no search/manage guidance.
+		lines = append(lines, buildSkillsHybridSection(cfg.PinnedSkillsSummary, false, false)...)
+	case (isFull || isTask) && !cfg.IsBootstrap && cfg.PinnedSkillsSummary != "":
+		// Hybrid mode: pinned skills inline + search for rest
+		lines = append(lines, buildSkillsHybridSection(cfg.PinnedSkillsSummary, cfg.HasSkillSearch, isFull && cfg.HasSkillManage)...)
+	case (isFull || isTask) && !cfg.IsBootstrap && (cfg.SkillsSummary != "" || cfg.HasSkillSearch || cfg.HasSkillManage):
+		if isTask {
 			// Task mode without pinned: search-only
 			lines = append(lines, buildSkillsSection("", cfg.HasSkillSearch, false)...)
 		} else {
@@ -396,7 +402,7 @@ func BuildSystemPrompt(cfg SystemPromptConfig) string {
 	}
 
 	// 4.1. Pinned skills — minimal/none mode standalone (pinned skills are explicitly chosen, always relevant)
-	if (isMinimal || isNone) && !cfg.IsBootstrap && cfg.PinnedSkillsSummary != "" {
+	if (isMinimal || isNone) && cfg.PinnedSkillsSummary != "" {
 		lines = append(lines, buildPinnedSkillsMinimalSection(cfg.PinnedSkillsSummary)...)
 	}
 
@@ -431,11 +437,6 @@ func BuildSystemPrompt(cfg SystemPromptConfig) string {
 	// None mode skips team sections entirely — identity-only prompt has no team awareness.
 	if !isNone && !cfg.IsBootstrap && cfg.IsTeamContext && hasTeamWorkspace(cfg.ToolNames) {
 		lines = append(lines, buildTeamWorkspaceSection(cfg.TeamWorkspace)...)
-	}
-
-	// 6.4. ## Team Members — inject roster so agent knows who to assign tasks to
-	if !isNone && !cfg.IsBootstrap && cfg.IsTeamContext && len(cfg.TeamMembers) > 0 {
-		lines = append(lines, buildTeamMembersSection(cfg.TeamMembers, cfg.TeamGuidance)...)
 	}
 
 	// 6.45. ## Delegation Targets — from agent_links (ModeDelegate or ModeTeam with targets)
@@ -611,6 +612,10 @@ func sanitizePromptContextValue(value string) string {
 // --- Section builders ---
 
 func buildToolingSection(toolNames []string, hasSandbox bool, shellDenyGroups map[string]bool) []string {
+	if len(toolNames) == 0 {
+		return nil
+	}
+
 	lines := []string{
 		"## Tooling",
 		"",
@@ -711,29 +716,14 @@ func buildSkillsSection(skillsSummary string, hasSkillSearch, hasSkillManage boo
 	if skillsSummary != "" {
 		// Inline mode: skills XML is in the prompt (like TS).
 		// Agent scans <available_skills> descriptions directly.
-		lines = append(lines,
-			"## Skills (mandatory)",
-			"",
-			"Before replying, scan `<available_skills>` below.",
-			"If a skill clearly applies, read its SKILL.md at the `<location>` path with `read_file`, then follow it.",
-			"If multiple could apply, choose the most specific one. Never read more than one skill up front.",
-			"If none apply, proceed normally.",
-			"",
-			skillsSummary,
-			"",
-		)
+		lines = append(lines, "## Skills (mandatory)", "")
+		lines = append(lines, skillLoadingProtocolLines()...)
+		lines = append(lines, skillsSummary, "")
 	} else if hasSkillSearch {
 		// Search mode: too many skills to inline, agent uses skill_search tool.
+		lines = append(lines, "## Skills (mandatory)", "")
+		lines = append(lines, skillLoadingProtocolLines()...)
 		lines = append(lines,
-			"## Skills (mandatory)",
-			"",
-			"Before replying, check if a skill applies:",
-			"1. Run `skill_search` with **English keywords** describing the domain (e.g. \"weather\", \"translate\", \"github\").",
-			"   Even if the user writes in another language, always search in English.",
-			"2. If a match is found, read its SKILL.md at the returned `location` with `read_file`, then follow it.",
-			"3. If multiple skills match, choose the most specific one. Never read more than one skill up front.",
-			"4. If no match, proceed normally.",
-			"",
 			"Constraints:",
 			"- Prefer `skill_search` over `browser` or `web_search` when the domain might have a skill.",
 			"- If skill_search returns no results, fall back to other tools freely.",
