@@ -372,7 +372,7 @@ func runGateway() {
 		slog.Debug("skipping MCP database init: pgStores.MCP is nil")
 	}
 
-	setupMemoryEmbeddings(pgStores, providerRegistry)
+	teamWorkEmbedder := setupMemoryEmbeddings(pgStores, providerRegistry)
 	usageCapSvc := usagecaps.NewService(pgStores.UsageCaps, pgStores.Providers)
 
 	// Resolve background provider for consolidation + vault enrichment.
@@ -407,8 +407,10 @@ func runGateway() {
 		}
 	}
 
+	var channelMemorySvc *channelmemory.Service
 	if memorySvc := makeChannelMemoryService(pgStores, domainBus, providerRegistry, usageCapSvc); memorySvc != nil {
-		cleanupChannelMemory := (&channelmemory.Worker{Service: memorySvc}).Start(context.Background())
+		channelMemorySvc = memorySvc
+		cleanupChannelMemory := (&channelmemory.Worker{Service: channelMemorySvc}).Start(context.Background())
 		defer cleanupChannelMemory()
 		slog.Info("channel memory extraction worker registered")
 	}
@@ -527,11 +529,13 @@ func runGateway() {
 		skillsLoader:     skillsLoader,
 		enrichProgress:   enrichProgress,
 		enrichWorker:     enrichWorker,
+		channelMemorySvc: channelMemorySvc,
 		workspace:        workspace,
 		dataDir:          dataDir,
 		domainBus:        domainBus,
 		usageCapSvc:      usageCapSvc,
 		audioMgr:         audioMgr,
+		teamWorkEmbedder: teamWorkEmbedder,
 	}
 
 	gatewayAddr := loopbackAddr(cfg.Gateway.Host, cfg.Gateway.Port)
@@ -639,7 +643,7 @@ func runGateway() {
 	// Register all RPC methods
 	server.SetLogTee(logTee)
 	server.SetRuntimeLogsHandler(httpapi.NewRuntimeLogsHandler(logTee))
-	pairingMethods, heartbeatMethods, chatMethods, cfgPermsMethods := registerAllMethods(server, agentRouter, pgStores.Sessions, pgStores.Tracing, pgStores.RunTimeline, pgStores.Cron, pgStores.Pairing, cfg, cfgPath, workspace, dataDir, msgBus, execApprovalMgr, pgStores.Agents, pgStores.Skills, pgStores.ConfigSecrets, pgStores.Teams, contextFileInterceptor, logTee, pgStores.Heartbeats, pgStores.ConfigPermissions, pgStores.SystemConfigs, pgStores.Tenants, pgStores.SkillTenantCfgs, audioMgr, usageCapSvc, providerRegistry)
+	pairingMethods, heartbeatMethods, chatMethods, cfgPermsMethods := registerAllMethods(server, agentRouter, pgStores.Sessions, pgStores.Tracing, pgStores.RunTimeline, pgStores.Cron, pgStores.Pairing, cfg, cfgPath, workspace, dataDir, msgBus, execApprovalMgr, pgStores.Agents, pgStores.Skills, pgStores.ConfigSecrets, pgStores.Teams, pgStores.AgentLinks, contextFileInterceptor, logTee, pgStores.Heartbeats, pgStores.ConfigPermissions, pgStores.SystemConfigs, pgStores.Tenants, pgStores.SkillTenantCfgs, audioMgr, usageCapSvc, providerRegistry, teamWorkEmbedder)
 
 	// Phase 3: Agent hooks RPC methods (hooks.list/create/update/delete/toggle/test/history).
 	if hs, ok := pgStores.Hooks.(hooks.HookStore); ok && hs != nil {
@@ -703,11 +707,48 @@ func runGateway() {
 		// Bitrix24 channels (imbot.unregister bot cleanup).
 		channelInstancesH.SetChannelManager(channelMgr)
 	}
+	if deps.channelMemorySvc != nil {
+		deps.channelMemorySvc.ContextResolver = channelmemory.ContextResolverFunc(func(ctx context.Context, inst *store.ChannelInstanceData, group store.PendingMessageGroup) (channelmemory.ExtractionContext, error) {
+			return resolveChannelMemoryExtractionContext(ctx, channelMgr, inst, group)
+		})
+	}
 
 	// Wire channel sender + tenant checker on message tool (now that channelMgr exists)
 	if t, ok := toolsReg.Get("message"); ok {
 		if cs, ok := t.(tools.ChannelSenderAware); ok {
 			cs.SetChannelSender(channelMgr.SendToChannel)
+		}
+		if ce, ok := t.(tools.ChannelEditorAware); ok {
+			ce.SetChannelEditor(channelMgr.EditChannelMessage)
+		}
+		if rs, ok := t.(tools.ReactionSetterAware); ok {
+			rs.SetReactionSetter(channelMgr.ReactToMessage)
+		}
+		if tr, ok := t.(tools.TopicResolverAware); ok && pgStores != nil && pgStores.Contacts != nil {
+			contacts := pgStores.Contacts
+			tr.SetTopicResolver(func(ctx context.Context, channel, chatID, topicName string) (string, bool) {
+				list, err := contacts.ListContacts(ctx, store.ContactListOpts{
+					ChannelInstance: channel,
+					ContactType:     "topic",
+					Limit:           500,
+				})
+				if err != nil {
+					return "", false
+				}
+				want := strings.ToLower(strings.TrimSpace(topicName))
+				for _, c := range list {
+					if c.SenderID != chatID || c.ThreadID == nil || c.DisplayName == nil {
+						continue
+					}
+					if strings.ToLower(strings.TrimSpace(*c.DisplayName)) == want {
+						return *c.ThreadID, true
+					}
+				}
+				return "", false
+			})
+		}
+		if tp, ok := t.(tools.TopicPosterAware); ok {
+			tp.SetTopicPoster(channelMgr.PostToTopic)
 		}
 		if tc, ok := t.(tools.ChannelTenantCheckerAware); ok {
 			tc.SetChannelTenantChecker(channelMgr.ChannelTenantID)
@@ -717,6 +758,12 @@ func runGateway() {
 	if t, ok := toolsReg.Get("list_group_members"); ok {
 		if gl, ok := t.(tools.GroupMemberListerAware); ok {
 			gl.SetGroupMemberLister(channelMgr.ListGroupMembers)
+		}
+	}
+	// Wire group lister on zalo_list_groups tool
+	if t, ok := toolsReg.Get("zalo_list_groups"); ok {
+		if gl, ok := t.(tools.GroupListerAware); ok {
+			gl.SetGroupLister(channelMgr.ListGroups)
 		}
 	}
 	// Wire Telegram manager on telegram_manager tool.
@@ -749,8 +796,9 @@ func runGateway() {
 		// the one used by pg.NewPGStores → NewPGBitrixPortalStore.
 		bitrixEncKey := os.Getenv("GOCLAW_ENCRYPTION_KEY")
 		// Use the MCP-aware factory variant so channels that opt into
-		// lazy per-user credential provisioning (via mcp_server_name +
-		// mcp_base_url in their instance config) can reach the partner's
+		// lazy per-user credential provisioning (via mcp_server_id — or
+		// the legacy mcp_server_name + mcp_base_url pair — in their
+		// instance config) can reach the partner's
 		// MCPServerStore. The MCP server authenticates each onboard call
 		// via the caller-supplied Bitrix access_token (the "Bitrix24
 		// OAuth → existing mcp_user_credentials bridge" — Bitrix-specific
@@ -772,6 +820,7 @@ func runGateway() {
 				pgStores.BitrixPortals,
 				pgStores.ChannelInstances,
 				server.PublicURLSnapshot().Get,
+				bitrixEncKey,
 			).Register(server.Router())
 		}
 

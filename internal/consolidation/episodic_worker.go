@@ -122,6 +122,7 @@ func (w *episodicWorker) Handle(ctx context.Context, event eventbus.DomainEvent)
 			EpisodicID:  ep.ID.String(),
 			SessionKey:  payload.SessionKey,
 			Summary:     summary,
+			KeyTopics:   entities,
 			KeyEntities: entities,
 		},
 	})
@@ -187,5 +188,6 @@ func (w *episodicWorker) summarizeFromMessages(ctx context.Context, provider pro
 	if err != nil {
 		return "", err
 	}
+	bgalert.ClearProviderError(ctx, w.alertDeps.SystemConfigs)
 	return resp.Content, nil
 }

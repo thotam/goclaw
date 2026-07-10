@@ -152,7 +152,7 @@ type DiscordConfig struct {
 	DMPolicy          string              `json:"dm_policy,omitempty"`       // "open" (default), "allowlist", "disabled"
 	GroupPolicy       string              `json:"group_policy,omitempty"`    // "open" (default), "allowlist", "disabled"
 	RequireMention    *bool               `json:"require_mention,omitempty"` // require @bot mention in groups (default true)
-	HistoryLimit      int                 `json:"history_limit,omitempty"`   // max pending group messages for context (default 50, 0=disabled)
+	HistoryLimit      int                 `json:"history_limit,omitempty"`   // max pending group messages for context (default 200, 0=disabled)
 	BlockReply        *bool               `json:"block_reply,omitempty"`     // override gateway block_reply (nil = inherit)
 	ChatBehavior      *ChatBehaviorConfig `json:"chat_behavior,omitempty"`   // override gateway chat behavior (nil = inherit)
 	MediaMaxBytes     int64               `json:"media_max_bytes,omitempty"` // max media download size (default 25MB)
@@ -276,6 +276,10 @@ type ProvidersConfig struct {
 	BytePlus       ProviderConfig  `json:"byteplus"`        // BytePlus ModelArk (Seed 2.0)
 	BytePlusCoding ProviderConfig  `json:"byteplus_coding"` // BytePlus ModelArk Coding Plan
 	Vertex         VertexConfig    `json:"vertex"`          // Google Cloud Vertex AI (OAuth2 service account + ADC)
+
+	// RequestTimeoutSec bounds provider verify and models-list HTTP calls.
+	// Tenant-scoped, overridable via the "providers.request_timeout_sec" system config.
+	RequestTimeoutSec int `json:"request_timeout_sec,omitempty"`
 }
 
 // VertexConfig configures Google Cloud Vertex AI.
@@ -433,6 +437,7 @@ type GatewayConfig struct {
 	BlockReply              *bool               `json:"block_reply,omitempty"`                // deliver intermediate text during tool iterations (default false)
 	ChatBehavior            *ChatBehaviorConfig `json:"chat_behavior,omitempty"`              // human-like channel delivery behavior (default disabled)
 	ToolStatus              *bool               `json:"tool_status,omitempty"`                // show tool name in streaming preview during tool execution (default true)
+	TeamWorkClassify        *bool               `json:"team_work_classify,omitempty"`         // classify new requests as direct handling or team workflow (default false)
 	TaskRecoveryIntervalSec int                 `json:"task_recovery_interval_sec,omitempty"` // team task recovery ticker interval in seconds (default 300 = 5min)
 	WebhookAsyncTimeoutSec  int                 `json:"webhook_async_timeout_sec,omitempty"`  // async webhook worker agent-run deadline in seconds (default 600, cap 3600)
 	WebhookSyncTimeoutSec   int                 `json:"webhook_sync_timeout_sec,omitempty"`   // sync + test webhook handler agent-run deadline in seconds (default 600, cap 3600). NOTE: sync holds the HTTP connection open for this duration — a value above an upstream proxy/LB read timeout may be cut.

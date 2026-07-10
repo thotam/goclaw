@@ -346,6 +346,51 @@ func (m *Manager) ListGroupMembers(ctx context.Context, channelName, chatID stri
 	return gmp.ListGroupMembers(ctx, chatID)
 }
 
+// ListGroups delegates to the channel's GroupListProvider if available.
+func (m *Manager) ListGroups(ctx context.Context, channelName string) ([]GroupInfo, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("channel %q not found", channelName)
+	}
+	glp, ok := ch.(GroupListProvider)
+	if !ok {
+		return nil, fmt.Errorf("channel %q does not support listing groups", channelName)
+	}
+	return glp.ListGroups(ctx)
+}
+
+// ResolveGroupTitle delegates to the channel's GroupTitleProvider if available.
+func (m *Manager) ResolveGroupTitle(ctx context.Context, channelName, chatID string) (string, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("channel %q not found", channelName)
+	}
+	gtp, ok := ch.(GroupTitleProvider)
+	if !ok {
+		return "", fmt.Errorf("channel %q does not support resolving group titles", channelName)
+	}
+	return gtp.ResolveGroupTitle(ctx, chatID)
+}
+
+// ResolveGroupTitles delegates to the channel's batch GroupTitlesProvider when available.
+func (m *Manager) ResolveGroupTitles(ctx context.Context, channelName string, chatIDs []string) (map[string]string, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("channel %q not found", channelName)
+	}
+	gtp, ok := ch.(GroupTitlesProvider)
+	if !ok {
+		return nil, fmt.Errorf("channel %q does not support resolving group titles", channelName)
+	}
+	return gtp.ResolveGroupTitles(ctx, chatIDs)
+}
+
 // ManageTelegram delegates a whitelisted Telegram management action to a
 // Telegram-capable channel instance.
 func (m *Manager) ManageTelegram(ctx context.Context, channelName string, req TelegramManagerRequest) (TelegramManagerResult, error) {

@@ -13,14 +13,14 @@ import (
 // builtinToolGroups is const-like seed data for per-Registry tool groups.
 // Do NOT modify at runtime — each Registry gets a deep copy in NewRegistry().
 var builtinToolGroups = map[string][]string{
-	"memory":     {"memory_search", "memory_get"},
+	"memory":     {"memory_search", "memory_get", "memory_expand", "knowledge_graph_search"},
 	"web":        {"web_search", "web_fetch"},
 	"fs":         {"read_file", "write_file", "list_files", "edit"},
 	"runtime":    {"exec", "wait"},
 	"sessions":   {"sessions_list", "sessions_history", "sessions_send", "spawn", "session_status"},
 	"ui":         {"browser"},
 	"automation": {"cron"},
-	"messaging":  {"message", "create_forum_topic", "list_group_members"},
+	"messaging":  {"message", "create_forum_topic", "list_group_members", "zalo_list_groups"},
 	"team":       {"team_tasks"},
 	"vault":      {"vault_search", "vault_read"},
 	// Composite group: all goclaw native tools (excludes MCP/custom plugins).
@@ -32,7 +32,7 @@ var builtinToolGroups = map[string][]string{
 		"sessions_list", "sessions_history", "sessions_send", "spawn", "session_status",
 		"delegate",
 		"cron", "datetime", "heartbeat",
-		"message", "create_forum_topic", "list_group_members",
+		"message", "create_forum_topic", "list_group_members", "zalo_list_groups",
 		"read_image", "read_document", "read_audio", "read_video",
 		"create_image", "create_video", "create_audio",
 		"skill_search", "skill_manage", "publish_skill", "use_skill",
@@ -527,7 +527,11 @@ func StripToolPrefix(tmpl, name string) string {
 	if strings.Contains(tmpl, placeholder) {
 		parts := strings.SplitN(tmpl, placeholder, 2)
 		prefix, suffix := parts[0], parts[1]
-		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) {
+		// Require the name to be at least as long as prefix+suffix so an
+		// overlapping match (e.g. tmpl "pre_{tool_name}_suf", name "pre_suf")
+		// doesn't slice with a negative length and panic.
+		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) &&
+			len(prefix)+len(suffix) <= len(name) {
 			result := name[len(prefix):]
 			if suffix != "" {
 				result = result[:len(result)-len(suffix)]

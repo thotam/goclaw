@@ -692,6 +692,13 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     timeout_sec  INT DEFAULT 60,
     settings     TEXT NOT NULL DEFAULT '{}',
     enabled      BOOLEAN NOT NULL DEFAULT 1,
+    -- require_user_credentials mirrors settings.require_user_credentials but
+    -- promoted to a top-level column so the Bitrix24 channel factory can
+    -- filter mcp_servers directly (indexable) rather than parse the full
+    -- JSONB per row. false = shared admin api_key applies to every caller.
+    -- true = the server mints credentials per-user at message time (Bitrix24
+    -- auto-onboard etc.).
+    require_user_credentials BOOLEAN NOT NULL DEFAULT 0,
     created_by   VARCHAR(255) NOT NULL,
     tenant_id    TEXT NOT NULL REFERENCES tenants(id),
     created_at   TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -1166,6 +1173,7 @@ CREATE TABLE IF NOT EXISTS channel_pending_messages (
     id              TEXT NOT NULL PRIMARY KEY,
     channel_name    VARCHAR(100) NOT NULL,
     history_key     VARCHAR(200) NOT NULL,
+    parent_history_key VARCHAR(200) NOT NULL DEFAULT '',
     sender          VARCHAR(255) NOT NULL,
     sender_id       VARCHAR(255) NOT NULL DEFAULT '',
     body            TEXT NOT NULL,
@@ -1177,6 +1185,7 @@ CREATE TABLE IF NOT EXISTS channel_pending_messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_channel_pending_messages_lookup ON channel_pending_messages(channel_name, history_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_channel_pending_messages_parent ON channel_pending_messages(channel_name, parent_history_key) WHERE parent_history_key <> '';
 CREATE INDEX IF NOT EXISTS idx_channel_pending_messages_tenant ON channel_pending_messages(tenant_id);
 
 -- ============================================================
@@ -1242,7 +1251,7 @@ CREATE TABLE IF NOT EXISTS channel_memory_extraction_items (
     episodic_id         VARCHAR(64) NOT NULL DEFAULT '',
     created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (tenant_id, run_id, item_hash)
+    UNIQUE (tenant_id, channel_instance_id, item_hash)
 );
 
 CREATE INDEX IF NOT EXISTS idx_channel_memory_items_channel_status

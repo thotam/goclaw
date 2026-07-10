@@ -17,6 +17,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/edition"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
+	"github.com/nextlevelbuilder/goclaw/internal/memory"
 	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
@@ -220,6 +221,14 @@ func setupToolRegistry(
 				filepath.Join(dataDir, "skills-store")+"/",
 				filepath.Join(dataDir, "tenants")+"/",
 			)
+			// Allow the goclaw-managed Python venv interpreter to be invoked with its
+			// absolute path. venv/bin/python3 is a symlink to the real interpreter
+			// (e.g. linuxbrew cellar), and matchesAnyPathExemption resolves symlinks
+			// before comparing — so we must exempt the *resolved* target dir.
+			// Resolved at startup; falls back silently if venv not present.
+			if real, err := filepath.EvalSymlinks(filepath.Join(filepath.Dir(dataDir), "venv", "bin", "python3")); err == nil {
+				et.AllowPathExemptions(filepath.Dir(real) + "/")
+			}
 			// Harden: block access to internal workspace files via shell commands.
 			// Prevents `cat ../config.json`, `cat memory.db` etc. from user workspaces.
 			et.DenyPaths(
@@ -294,7 +303,7 @@ func wireTracingAndCron(
 ) (*tracing.Collector, *tracing.SnapshotWorker) {
 	var traceCollector *tracing.Collector
 	if stores.Tracing != nil {
-		traceCollector = tracing.NewCollector(stores.Tracing)
+		traceCollector = tracing.NewCollector(stores.Tracing, stores.UsageEvents)
 		traceCollector.OnFlush = func(traceIDs []uuid.UUID) {
 			ids := make([]string, len(traceIDs))
 			for i, id := range traceIDs {
@@ -362,9 +371,11 @@ func wireTracingAndCron(
 func setupMemoryEmbeddings(
 	pgStores *store.Stores,
 	providerRegistry *providers.Registry,
-) {
+) memory.EmbeddingProvider {
+	var resolved memory.EmbeddingProvider
 	if pgStores.Memory != nil {
 		if embProvider := resolveEmbeddingProvider(pgStores.Providers, providerRegistry, pgStores.SystemConfigs); embProvider != nil {
+			resolved = embProvider
 			pgStores.Memory.SetEmbeddingProvider(embProvider)
 			slog.Info("memory embeddings enabled", "provider", embProvider.Name(), "model", embProvider.Model())
 
@@ -423,6 +434,7 @@ func setupMemoryEmbeddings(
 			slog.Warn("memory embeddings disabled (no API key), chunks stored without vectors")
 		}
 	}
+	return resolved
 }
 
 // seedSystemConfigs ensures system_configs has all expected keys for all tenants.
