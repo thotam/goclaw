@@ -224,6 +224,7 @@
       "excludeGroups": "Excluded Discord channels",
       "excludeGroupsPlaceholder": "Select a channel to exclude",
       "manualExcludePlaceholder": "Paste Discord channel ID",
+      "useDiscordChannelId": "Use Discord channel ID:",
       "addExcludedGroup": "Add",
       "noExcludeGroups": "No Discord channel history found yet.",
       "noExcludedGroups": "No channels excluded.",
@@ -393,6 +394,10 @@
     },
     "reaction_level": {
       "label": "Reaction Level"
+    },
+    "activity_indicator": {
+      "label": "Activity Indicator",
+      "help": "Show a native \"agent is working\" indicator (thinking/searching/generating…) while the agent processes. Ephemeral, not a chat message."
     },
     "media_max_mb": {
       "label": "Max Media Size (MB)"

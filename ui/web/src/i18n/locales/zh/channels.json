@@ -223,6 +223,7 @@
       "excludeGroups": "排除的 Discord 频道",
       "excludeGroupsPlaceholder": "选择要排除的频道",
       "manualExcludePlaceholder": "粘贴 Discord 频道 ID",
+      "useDiscordChannelId": "使用 Discord 频道 ID：",
       "addExcludedGroup": "添加",
       "noExcludeGroups": "尚未发现 Discord 频道历史。",
       "noExcludedGroups": "尚未排除任何频道。",
@@ -392,6 +393,10 @@
     },
     "reaction_level": {
       "label": "表情回应级别"
+    },
+    "activity_indicator": {
+      "label": "活动指示器",
+      "help": "在智能体处理时显示原生的“智能体工作中”指示器（思考/搜索/生成…）。临时显示，不是聊天消息。"
     },
     "media_max_mb": {
       "label": "最大媒体大小 (MB)"
