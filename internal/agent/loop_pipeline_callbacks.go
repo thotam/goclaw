@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,7 +41,7 @@ func (l *Loop) pipelineCallbacks(req *RunRequest, bridgeRS *runState) pipelineCa
 		event.ChatID = req.ChatID
 		event.SessionKey = req.SessionKey
 		event.TenantID = l.tenantID
-		l.emit(event)
+		l.emit(redactDelegationAgentEvent(req, event))
 	}
 	return pipelineCallbackSet{
 		emitRun:            emitRun,
@@ -95,7 +96,7 @@ type pipelineCallbackSet struct {
 	flushMessages      func(ctx context.Context, sessionKey string, msgs []providers.Message) error
 	updateMetadata     func(ctx context.Context, sessionKey string, usage, lastUsage providers.Usage, msgCount int) error
 	bootstrapCleanup   func(ctx context.Context, state *pipeline.RunState) error
-	maybeSummarize     func(ctx context.Context, sessionKey string)
+	maybeSummarize     func(ctx context.Context, sessionKey string, midLoopCompacted bool)
 }
 
 func (l *Loop) makeResolveWorkspace(req *RunRequest) func(ctx context.Context, input *pipeline.RunInput) (*workspace.WorkspaceContext, error) {
@@ -188,13 +189,30 @@ func (l *Loop) makeEnrichMedia(req *RunRequest) func(ctx context.Context, state 
 		if len(msgs) == 0 {
 			return nil
 		}
-		enrichedCtx, enrichedMsgs, _ := l.enrichInputMedia(ctx, req, msgs)
+		enrichedCtx, enrichedMsgs, currentRefs := l.enrichInputMedia(ctx, req, msgs)
 		// Propagate enriched context (media images/docs/audio/video refs for tools).
 		state.Ctx = enrichedCtx
 		// Update history with enriched messages (media tags, inline images).
 		// Skip system message (index 0) — only history + user messages are enriched.
 		if len(enrichedMsgs) > 1 {
 			state.Messages.SetHistory(enrichedMsgs[1:])
+		}
+		// Preserve the enriched current input for the first session checkpoint.
+		// Inline image bytes stay request-local; durable history stores only the
+		// logical tags plus absolute MediaRefs used internally for exact lookup.
+		if len(currentRefs) > 0 {
+			for i := len(enrichedMsgs) - 1; i >= 0; i-- {
+				if enrichedMsgs[i].Role != "user" {
+					continue
+				}
+				req.enrichedInputMessage = providers.Message{
+					Role:      "user",
+					Content:   enrichedMsgs[i].Content,
+					MediaRefs: append([]providers.MediaRef(nil), currentRefs...),
+				}
+				req.hasEnrichedInputMessage = true
+				break
+			}
 		}
 		return nil
 	}
@@ -231,17 +249,22 @@ func (l *Loop) makeBuildFilteredTools(req *RunRequest) func(state *pipeline.RunS
 		// Servers with require_user_credentials are deferred at startup and
 		// connected per-request here with the actual user's credentials.
 		//
-		// Use resolveActorUserID — the gateway consumer rewrites UserID in
-		// two scenarios (group chats AND DM with merged contact), both of
-		// which break per-user MCP credential lookup. ChannelType discriminates
-		// Bitrix24 (always prefer SenderID) from other channels (group-only
-		// rewrite recovery). See resolveActorUserID docstring for full rationale.
-		actorUserID := resolveActorUserID(
-			state.Input.UserID,
-			state.Input.SenderID,
-			state.Input.PeerKind,
-			state.Input.ChannelType,
-		)
+		// Prefer CredentialUserID from context — resolveCredentialUserID already
+		// resolved the merged tenant_user identity (e.g. Telegram group merged
+		// to a tenant_user via UI). Using the raw SenderID or group composite
+		// as the cache key would miss the credential row keyed by the merged
+		// tenant_user UUID. Fall back to resolveActorUserID for channels without
+		// merge resolution (backward compat). See resolveActorUserID docstring
+		// for the group-rewrite recovery rationale.
+		actorUserID := store.CredentialUserIDFromContext(state.Ctx)
+		if actorUserID == "" {
+			actorUserID = resolveActorUserID(
+				state.Input.UserID,
+				state.Input.SenderID,
+				state.Input.PeerKind,
+				state.Input.ChannelType,
+			)
+		}
 		userTools := l.getUserMCPTools(state.Ctx, actorUserID)
 		slog.Debug("mcp.user_tools_context",
 			"peer_kind", state.Input.PeerKind,
@@ -347,6 +370,22 @@ func (l *Loop) makeCallLLM(req *RunRequest, emitRun func(AgentEvent)) func(ctx c
 		provider := state.Provider
 		model := state.Model
 
+		// Issue 3: surface transient provider retries to the user ("Provider busy,
+		// retrying...") instead of a silent failure ending in a 💔 reaction. The
+		// providers' internal RetryDo / codex loops fire this hook before each retry
+		// attempt; the channel layer turns run.retrying into a placeholder update.
+		ctx = providers.WithRetryHook(ctx, func(attempt, maxAttempts int, _ error) {
+			emitRun(AgentEvent{
+				Type:    protocol.AgentEventRunRetrying,
+				AgentID: l.id,
+				RunID:   req.RunID,
+				Payload: map[string]string{
+					"attempt":     strconv.Itoa(attempt),
+					"maxAttempts": strconv.Itoa(maxAttempts),
+				},
+			})
+		})
+
 		// Enrich ChatRequest options to match v2 (providers need these for caching, routing, audit).
 		if chatReq.Options == nil {
 			chatReq.Options = make(map[string]any)
@@ -360,6 +399,12 @@ func (l *Loop) makeCallLLM(req *RunRequest, emitRun func(AgentEvent)) func(ctx c
 		chatReq.Options[providers.OptPeerKind] = req.PeerKind
 		chatReq.Options[providers.OptLocalKey] = req.LocalKey
 		chatReq.Options[providers.OptWorkspace] = tools.ToolWorkspaceFromCtx(ctx)
+		if delegationID := tools.DelegationIDFromCtx(ctx); delegationID != "" {
+			chatReq.Options[providers.OptDelegationID] = delegationID
+		}
+		if inputs := tools.DelegationArtifactInputsFromCtx(ctx); inputs != "" {
+			chatReq.Options[providers.OptDelegationInputs] = inputs
+		}
 		// Pass the policy-filtered allowed tool set so the Claude CLI provider
 		// can restrict its native built-in tools (Bash, Edit, Write, Read,
 		// WebFetch, WebSearch) to what the agent's tool policy actually allows.
@@ -701,13 +746,17 @@ func (l *Loop) makeFlushMessages(req *RunRequest) func(ctx context.Context, sess
 	return func(ctx context.Context, sessionKey string, msgs []providers.Message) error {
 		if !userMsgFlushed && !req.HideInput && req.Message != "" {
 			userMsgFlushed = true
-			l.sessions.AddMessage(ctx, sessionKey, providers.Message{
+			inputMessage := providers.Message{
 				Role:    "user",
 				Content: req.Message,
-			})
+			}
+			if req.hasEnrichedInputMessage {
+				inputMessage = req.enrichedInputMessage
+			}
+			l.sessions.AddMessage(ctx, sessionKey, redactDelegationMessage(req, inputMessage))
 		}
 		for _, msg := range msgs {
-			l.sessions.AddMessage(ctx, sessionKey, msg)
+			l.sessions.AddMessage(ctx, sessionKey, redactDelegationMessage(req, msg))
 		}
 		return nil
 	}
@@ -759,13 +808,25 @@ func (l *Loop) makeBootstrapCleanup() func(ctx context.Context, state *pipeline.
 }
 
 func (l *Loop) reserveLLMUsage(ctx context.Context, req *RunRequest, state *pipeline.RunState, chatReq providers.ChatRequest, attempt string) (*usagecaps.Reservation, error) {
-	if l.usageCaps == nil || state.Provider == nil {
-		return nil, nil
+	providerName := ""
+	if state.Provider != nil {
+		providerName = state.Provider.Name()
 	}
-	return l.reserveLLMUsageFor(ctx, req, state.Iteration, chatReq, attempt, state.Provider.Name(), state.Model)
+	// reserveLLMUsageFor runs the mandatory hard-ceiling guard before any
+	// reservation or transport, so the non-fallback path is guarded here even
+	// when usage caps are disabled (Lite runtime).
+	return l.reserveLLMUsageFor(ctx, req, state.Iteration, chatReq, attempt, providerName, state.Model)
 }
 
 func (l *Loop) reserveLLMUsageFor(ctx context.Context, req *RunRequest, iteration int, chatReq providers.ChatRequest, attempt, providerName, model string) (*usagecaps.Reservation, error) {
+	// Mandatory final hard-ceiling guard for the concrete request that is about
+	// to be sent, after all directive/retry/reasoning mutations. This is the
+	// shared pre-transport chokepoint for BOTH the fallback candidate path and
+	// the non-fallback path (via reserveLLMUsage), and for every retry attempt.
+	// It runs regardless of usage-cap configuration so the ceiling holds on Lite.
+	if guardErr := l.guardCompleteModelRequest(chatReq, providerName, model, attempt); guardErr != nil {
+		return nil, guardErr
+	}
 	if l.usageCaps == nil {
 		return nil, nil
 	}
