@@ -20,9 +20,9 @@ import (
 const (
 	budgetEncodingPattern = `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
 	budgetMessageOverhead = 4
-	// InlineMediaUnit is the flat token cost of one media item attached to a
-	// message. Out-of-band payloads are charged the same unit so every media
-	// transport agrees on one number.
+	// InlineMediaUnit is the flat token cost this counter charges for one image,
+	// video or audio part carried by a structured message, whose bytes it cannot
+	// size. It is a placeholder unit, not a measurement of the payload.
 	InlineMediaUnit = 1600
 )
 

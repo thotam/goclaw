@@ -2,14 +2,52 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/nextlevelbuilder/goclaw/internal/mediabudget"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
-	"github.com/nextlevelbuilder/goclaw/internal/tokencount"
 	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
+
+// budgetRefusalError marks a denial that came from the budget, not from a
+// provider being unwell. A media fallback chain must stop on one: trying the
+// next provider only moves the same payload to another endpoint, and the next
+// entry may not price media at all.
+type budgetRefusalError struct{ err error }
+
+func (e *budgetRefusalError) Error() string { return e.err.Error() }
+func (e *budgetRefusalError) Unwrap() error { return e.err }
+
+// asBudgetRefusal marks err when it is one of the budget denials, and returns
+// it untouched otherwise. Every gate on the media path funnels through here:
+// the unmeasurable-media refusal, the agent context window, the missing-budget
+// wiring failure, and the tenant usage cap.
+func asBudgetRefusal(err error) error {
+	if err == nil {
+		return nil
+	}
+	var windowErr *usagecaps.ContextWindowExceededError
+	var wiringErr *usagecaps.AgentBudgetWiringError
+	switch {
+	case errors.Is(err, mediabudget.ErrDurationUnmeasurable),
+		errors.Is(err, usagecaps.ErrCapExceeded),
+		errors.As(err, &windowErr),
+		errors.As(err, &wiringErr):
+		return &budgetRefusalError{err: err}
+	default:
+		return err
+	}
+}
+
+// isBudgetRefusal reports whether err is a budget denial, however deeply it has
+// been wrapped on its way back up.
+func isBudgetRefusal(err error) bool {
+	var refusal *budgetRefusalError
+	return errors.As(err, &refusal)
+}
 
 func agentBudgetFromContext(ctx context.Context) usagecaps.AgentBudget {
 	return usagecaps.AgentBudget{
@@ -22,29 +60,44 @@ func agentBudgetFromContext(ctx context.Context) usagecaps.AgentBudget {
 // input already lives in the ChatRequest. The fixed local BudgetCounter counts
 // the request itself.
 func reserveToolLLMUsage(ctx context.Context, svc *usagecaps.Service, toolName, providerName, model string, req providers.ChatRequest) (*usagecaps.Reservation, error) {
-	return reserveToolLLMUsageWithMedia(ctx, svc, toolName, providerName, model, req, 0)
+	return reserveToolLLMUsageWithMediaTokens(ctx, svc, toolName, providerName, model, req, 0)
 }
 
 // reserveToolLLMUsageWithMedia guards a native-media tool call whose payload is
 // sent OUT-OF-BAND (native provider JSON body or File API upload) and is thus
-// invisible to the ChatRequest the counter would otherwise see. Each payload is
-// charged the flat tokencount.InlineMediaUnit the counter already applies to
-// structured message media, so inline and out-of-band transports agree on one
-// number and no path has to buffer bytes in order to be countable.
-func reserveToolLLMUsageWithMedia(ctx context.Context, svc *usagecaps.Service, toolName, providerName, model string, req providers.ChatRequest, mediaItems int) (*usagecaps.Reservation, error) {
+// invisible to the ChatRequest the counter would otherwise see. A payload
+// mediabudget cannot price aborts the call rather than being waved through at
+// an invented number.
+func reserveToolLLMUsageWithMedia(ctx context.Context, svc *usagecaps.Service, toolName, providerName, model string, req providers.ChatRequest, media ...mediabudget.Payload) (*usagecaps.Reservation, error) {
 	mediaTokens := 0
-	if mediaItems > 0 {
-		mediaTokens = mediaItems * tokencount.InlineMediaUnit
+	for _, p := range media {
+		tokens, err := mediabudget.Tokens(ctx, p)
+		if err != nil {
+			return nil, asBudgetRefusal(err)
+		}
+		mediaTokens += tokens
 	}
+	return reserveToolLLMUsageWithMediaTokens(ctx, svc, toolName, providerName, model, req, mediaTokens)
+}
+
+// refuseUnpriceableMedia is the front gate for a payload whose cost cannot be
+// established at all, used where there is not even a Payload to hand to
+// mediabudget. It carries the same terminal marker as a priced refusal.
+func refuseUnpriceableMedia(kind mediabudget.Kind, cause error) error {
+	return asBudgetRefusal(fmt.Errorf("%s budget: %w", kind, cause))
+}
+
+// reserveToolLLMUsageWithMediaTokens is the shared path for a media charge that is already a token count, not a mediabudget.Payload.
+func reserveToolLLMUsageWithMediaTokens(ctx context.Context, svc *usagecaps.Service, toolName, providerName, model string, req providers.ChatRequest, mediaTokens int) (*usagecaps.Reservation, error) {
 	budget := agentBudgetFromContext(ctx)
 	req = clampToolRequestMaxTokens(req, budget.MaxTokens)
 	if guardErr := usagecaps.GuardContextWindowWithMediaTokens(req, providerName, model, "tool:"+toolName, budget, mediaTokens); guardErr != nil {
-		return nil, guardErr
+		return nil, asBudgetRefusal(guardErr)
 	}
 	if svc == nil {
 		return nil, nil
 	}
-	return svc.Preflight(ctx, usagecaps.Request{
+	reservation, err := svc.Preflight(ctx, usagecaps.Request{
 		TenantID:         store.TenantIDFromContext(ctx),
 		AgentID:          store.AgentIDFromContext(ctx),
 		ProviderName:     providerName,
@@ -54,6 +107,7 @@ func reserveToolLLMUsageWithMedia(ctx context.Context, svc *usagecaps.Service, t
 		MaxOutputTokens:  budget.MaxTokens,
 		ExtraInputTokens: mediaTokens,
 	})
+	return reservation, asBudgetRefusal(err)
 }
 
 // clampToolRequestMaxTokens enforces max_tokens <= agentMaxTokens for every
