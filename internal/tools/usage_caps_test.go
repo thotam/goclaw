@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -79,13 +78,11 @@ func TestReserveToolLLMUsage_FailsClosedWithoutAgentBudget(t *testing.T) {
 	}
 }
 
-// TestReserveToolLLMUsageWithMedia_CountsNativeMediaBytes proves the out-of-band
-// media payload is part of completeInput. The fixed BudgetCounter counts the
-// standard-base64 representation of the raw bytes (a model/provider-independent
-// rule), so a small prompt with a large native-media payload is blocked when it
-// no longer fits the CALLING agent's window. The bytes are counted, never
-// transported — the guard copy carries them, the real request does not.
-func TestReserveToolLLMUsageWithMedia_CountsNativeMediaBytes(t *testing.T) {
+// TestReserveToolLLMUsageWithMedia_ChargesFlatUnitPerItem proves an out-of-band
+// payload is part of completeInput at a flat per-item cost, independent of its
+// byte size. Size independence is the point: counting bytes made every
+// real-world video exceed every window.
+func TestReserveToolLLMUsageWithMedia_ChargesFlatUnitPerItem(t *testing.T) {
 	model := "gpt-4o"
 	req := func() providers.ChatRequest {
 		return providers.ChatRequest{
@@ -95,20 +92,18 @@ func TestReserveToolLLMUsageWithMedia_CountsNativeMediaBytes(t *testing.T) {
 		}
 	}
 
-	// A small media payload under a large agent window is allowed.
-	small := bytes.Repeat([]byte{0xAB}, 1024)
+	// One media item fits a large window, whatever the payload behind it.
 	ctxBig := withToolAgentBudget(128_000, 8_192)
-	if _, err := reserveToolLLMUsageWithMedia(ctxBig, nil, "read_document", "openai", model, req(), "application/pdf", small); err != nil {
-		t.Fatalf("small native media must fit a 128k window, got %v", err)
+	if _, err := reserveToolLLMUsageWithMedia(ctxBig, nil, "read_document", "openai", model, req(), 1); err != nil {
+		t.Fatalf("one media item must fit a 128k window, got %v", err)
 	}
 
-	// A large media payload against a small agent window is blocked BEFORE
-	// transport: base64(256 KiB) is well over the 20k window's input cap.
-	big := bytes.Repeat([]byte{0xCD}, 256*1024)
+	// The charge is real: enough items against a small window abort before
+	// transport.
 	ctxSmall := withToolAgentBudget(20_000, 8_192)
-	_, err := reserveToolLLMUsageWithMedia(ctxSmall, nil, "read_document", "openai", model, req(), "application/pdf", big)
+	_, err := reserveToolLLMUsageWithMedia(ctxSmall, nil, "read_document", "openai", model, req(), 8)
 	if err == nil {
-		t.Fatal("expected abort: large native media must exceed a 20k agent window")
+		t.Fatal("expected abort: 8 media items plus an 8192 output reserve exceed a 20k window")
 	}
 	var ctxErr *usagecaps.ContextWindowExceededError
 	if !errors.As(err, &ctxErr) {
@@ -116,44 +111,5 @@ func TestReserveToolLLMUsageWithMedia_CountsNativeMediaBytes(t *testing.T) {
 	}
 	if ctxErr.ContextWindow != 20_000 {
 		t.Fatalf("guard used window %d, want 20000 (agent cap)", ctxErr.ContextWindow)
-	}
-}
-
-// TestReserveToolLLMUsageUnverifiableMedia_FailsClosedUnderAgentBudget proves a
-// native-media call whose payload cannot be buffered (a streamed remote URL)
-// fails closed under an agent budget rather than undercounting — the
-// complete-input invariant cannot be proven, so it refuses to send.
-func TestReserveToolLLMUsageUnverifiableMedia_FailsClosedUnderAgentBudget(t *testing.T) {
-	model := "gemini-2.0-flash"
-	req := providers.ChatRequest{
-		Model:    model,
-		Messages: []providers.Message{{Role: "user", Content: "Analyze this video."}},
-		Options:  map[string]any{providers.OptMaxTokens: 4096},
-	}
-
-	// Under an agent budget: no in-memory payload to count -> refuse with an
-	// explicit streaming error (not a wiring error).
-	ctx := withToolAgentBudget(200_000, 8_192)
-	_, err := reserveToolLLMUsageUnverifiableMedia(ctx, nil, "read_video", "gemini", model, req)
-	if err == nil {
-		t.Fatal("expected fail-closed for unverifiable streamed media under an agent budget")
-	}
-	var wiringErr *usagecaps.AgentBudgetWiringError
-	if errors.As(err, &wiringErr) {
-		t.Fatalf("under a valid agent budget the failure must be the streaming refusal, not a wiring error: %v", err)
-	}
-	if !strings.Contains(err.Error(), "refusing to send") {
-		t.Fatalf("expected an explicit streaming refusal, got %v", err)
-	}
-
-	// Without a propagated agent budget it falls through to the text path, which
-	// itself fails closed with a wiring error — every tool LLM call is
-	// agent-scoped, so no path here reaches transport uncounted.
-	_, err = reserveToolLLMUsageUnverifiableMedia(context.Background(), nil, "read_video", "gemini", model, req)
-	if err == nil {
-		t.Fatal("expected fail-closed without a propagated agent budget")
-	}
-	if !errors.As(err, &wiringErr) {
-		t.Fatalf("expected *AgentBudgetWiringError without a budget, got %T: %v", err, err)
 	}
 }

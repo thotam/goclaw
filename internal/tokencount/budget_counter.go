@@ -20,7 +20,10 @@ import (
 const (
 	budgetEncodingPattern = `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
 	budgetMessageOverhead = 4
-	budgetInlineMediaUnit = 1600
+	// InlineMediaUnit is the flat token cost of one media item attached to a
+	// message. Out-of-band payloads are charged the same unit so every media
+	// transport agrees on one number.
+	InlineMediaUnit = 1600
 )
 
 //go:embed cl100k_base.tiktoken.gz
@@ -80,12 +83,12 @@ func (c *fixedBudgetCounter) CountMessages(messages []providers.Message) (int, e
 		}
 		for _, image := range message.Images {
 			if image.Data != "" || image.URL != "" {
-				total += budgetInlineMediaUnit
+				total += InlineMediaUnit
 			}
 		}
 		for _, video := range message.Videos {
 			if video.Data != "" || video.URL != "" {
-				total += budgetInlineMediaUnit
+				total += InlineMediaUnit
 			}
 		}
 	}

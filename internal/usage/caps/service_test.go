@@ -525,3 +525,43 @@ func (s *fakeProviderStore) UpdateProvider(context.Context, uuid.UUID, map[strin
 func (s *fakeProviderStore) DeleteProvider(context.Context, uuid.UUID) error { return nil }
 
 func int64Ptr(v int64) *int64 { return &v }
+
+// TestPreflightCountsExtraInputTokens proves an out-of-band media charge reaches
+// the reservation, not just the context-window guard. Without it the reservation
+// under-reserves by the whole payload.
+func TestPreflightCountsExtraInputTokens(t *testing.T) {
+	providerID := uuid.New()
+	tenantID := uuid.New()
+	newService := func() (*Service, *fakeUsageCapStore) {
+		policy := store.UsageCapPolicy{ID: uuid.New(), TenantID: tenantID, MaxTokens: int64Ptr(1_000_000), Enabled: true}
+		usageStore := &fakeUsageCapStore{policies: []store.UsageCapPolicy{policy}, resolveErr: sql.ErrNoRows}
+		providerStore := &fakeProviderStore{provider: &store.LLMProviderData{
+			BaseModel:    store.BaseModel{ID: providerID},
+			Name:         "openrouter",
+			ProviderType: store.ProviderOpenRouter,
+			APIKey:       "sk-test",
+		}}
+		return NewService(usageStore, providerStore), usageStore
+	}
+	request := func(extra int) Request {
+		return Request{
+			TenantID: tenantID, ProviderName: "openrouter", ModelID: "some/model",
+			ReservationKey: "extra-input", Messages: []providers.Message{{Role: "user", Content: "describe this video"}},
+			MaxOutputTokens: 10, ExtraInputTokens: extra,
+		}
+	}
+
+	svcBase, storeBase := newService()
+	if _, err := svcBase.Preflight(context.Background(), request(0)); err != nil {
+		t.Fatalf("Preflight without extra tokens returned error: %v", err)
+	}
+
+	svcExtra, storeExtra := newService()
+	if _, err := svcExtra.Preflight(context.Background(), request(1600)); err != nil {
+		t.Fatalf("Preflight with extra tokens returned error: %v", err)
+	}
+
+	if got := storeExtra.reserved.EstimatedTokens - storeBase.reserved.EstimatedTokens; got != 1600 {
+		t.Fatalf("EstimatedTokens grew by %d, want 1600", got)
+	}
+}
