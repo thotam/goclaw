@@ -53,27 +53,19 @@ func TestReadVideo_PrivateURL_Error(t *testing.T) {
 	}
 }
 
-// TestReadVideo_GeminiURL_FailsClosedUnderAgentBudget locks the fail-closed
-// contract for a streamed video URL. The stream is never buffered, so its bytes
-// cannot be counted into completeInput; under an agent budget the call refuses
-// before any transport rather than undercounting. Because every tool LLM call
-// is agent-scoped in production, this refusal — not the downstream
-// Content-Length / 2 GB / HTTP-status checks — is the reachable behavior. Those
-// transport validations remain in callProvider for defense in depth but are
-// unreachable once an agent budget is present.
-func TestReadVideo_GeminiURL_FailsClosedUnderAgentBudget(t *testing.T) {
+// TestReadVideo_GeminiURL_ReachesTransportUnderAgentBudget locks the contract for
+// a streamed video URL: the reservation charges one flat media unit rather than
+// trying to count bytes it does not hold, so the call proceeds to transport
+// instead of refusing. The server answers 500 so the flow stops at the status
+// check, well before any provider call.
+func TestReadVideo_GeminiURL_ReachesTransportUnderAgentBudget(t *testing.T) {
 	security.SetAllowLoopbackForTest(true)
 	defer security.SetAllowLoopbackForTest(false)
 
-	// A server that would otherwise satisfy the static-streaming constraints
-	// (valid Content-Length, 2xx). The call must still fail closed before it is
-	// ever contacted, because the payload cannot be counted.
 	hits := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
-		w.Header().Set("Content-Length", "1024")
-		w.WriteHeader(http.StatusOK)
-		w.Write(make([]byte, 1024))
+		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer ts.Close()
 
@@ -91,12 +83,66 @@ func TestReadVideo_GeminiURL_FailsClosedUnderAgentBudget(t *testing.T) {
 
 	_, _, err := tool.callProvider(ctx, cp, "gemini", "gemini-2.5-flash", params)
 	if err == nil {
-		t.Fatalf("expected fail-closed for an unverifiable streamed video URL under an agent budget")
+		t.Fatal("expected the 500 response to surface as an error")
 	}
-	if !strings.Contains(err.Error(), "cannot verify streamed native media") {
-		t.Errorf("unexpected error, want fail-closed refusal: %v", err)
+	if strings.Contains(err.Error(), "cannot verify streamed native media") {
+		t.Fatalf("the reservation must no longer fail closed on a streamed URL: %v", err)
 	}
-	if hits != 0 {
-		t.Errorf("fail-closed must refuse before any transport, but the URL was contacted %d time(s)", hits)
+	if !strings.Contains(err.Error(), "status code 500") {
+		t.Fatalf("expected the transport status check to reject, got: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("the URL was contacted %d time(s), want 1", hits)
+	}
+}
+
+// TestReadVideo_GeminiURL_RejectsMissingContentLength covers the Content-Length
+// check in read_video_resolve.go, which was dead code while the fail-closed
+// reservation refused every streamed URL before transport.
+func TestReadVideo_GeminiURL_RejectsMissingContentLength(t *testing.T) {
+	security.SetAllowLoopbackForTest(true)
+	defer security.SetAllowLoopbackForTest(false)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK) // empty body: Go sends Content-Length: 0
+	}))
+	defer ts.Close()
+
+	tool := NewReadVideoTool(nil, nil)
+	cp := &mockCredentialProvider{apiKey: "test-key"}
+	ctx := store.WithAgentContextWindow(context.Background(), 200_000)
+	ctx = store.WithAgentMaxTokens(ctx, 32_000)
+
+	_, _, err := tool.callProvider(ctx, cp, "gemini", "gemini-2.5-flash", map[string]any{
+		"prompt": "describe this video", "url": ts.URL, "_provider_type": "gemini",
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not support static streaming") {
+		t.Fatalf("expected the Content-Length check to reject, got: %v", err)
+	}
+}
+
+// TestReadVideo_GeminiURL_RejectsOversizedStream covers the 2 GB stream ceiling
+// in read_video_resolve.go, which was dead code while the fail-closed
+// reservation refused every streamed URL before transport.
+func TestReadVideo_GeminiURL_RejectsOversizedStream(t *testing.T) {
+	security.SetAllowLoopbackForTest(true)
+	defer security.SetAllowLoopbackForTest(false)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "3221225472") // 3 GB, over the 2 GB ceiling
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	tool := NewReadVideoTool(nil, nil)
+	cp := &mockCredentialProvider{apiKey: "test-key"}
+	ctx := store.WithAgentContextWindow(context.Background(), 200_000)
+	ctx = store.WithAgentMaxTokens(ctx, 32_000)
+
+	_, _, err := tool.callProvider(ctx, cp, "gemini", "gemini-2.5-flash", map[string]any{
+		"prompt": "describe this video", "url": ts.URL, "_provider_type": "gemini",
+	})
+	if err == nil || !strings.Contains(err.Error(), "exceeds the maximum limit of 2 GB") {
+		t.Fatalf("expected the 2 GB ceiling to reject, got: %v", err)
 	}
 }
