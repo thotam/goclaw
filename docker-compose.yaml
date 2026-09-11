@@ -1,0 +1,153 @@
+# Merged từ: docker-compose.yml + docker-compose.postgres.yml + docker-compose.claude-cli.yml
+#             + docker-compose.browser.yml (headless Chrome sidecar)
+# Dùng cho aaPanel hoặc môi trường chỉ cần 1 file duy nhất.
+#
+# Khởi động:
+#   docker compose -f docker-compose.yaml up -d
+#   # Dashboard: http://localhost:18790
+#   # CDP Chrome: ws://localhost:${CHROME_CDP_PORT:-9222}
+
+services:
+
+  # Đổi tên thành goclaw-db để tránh conflict DNS với postgres khác trên baota_net
+  goclaw-db:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-goclaw}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-goclaw}
+      POSTGRES_DB: ${POSTGRES_DB:-goclaw}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-goclaw} -d ${POSTGRES_DB:-goclaw}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - goclaw-internal   # chỉ nội bộ, không ra baota_net
+
+  # Headless Chrome sidecar - phục vụ browser automation qua CDP (:9222)
+  chrome:
+    image: chromedp/headless-shell:latest
+    command:
+      - --no-sandbox
+      - --headless=new
+      - --remote-allow-origins=*
+      - --disable-gpu
+      - --disable-dev-shm-usage
+    # ports:
+    #   - "${CHROME_CDP_PORT:-9222}:9222"
+    shm_size: 2gb
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9222"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+    networks:
+      - goclaw-internal   # giao tiếp nội bộ với goclaw
+    restart: unless-stopped
+
+  chrome-proxy:
+    image: nginx:alpine
+    depends_on:
+      chrome:
+        condition: service_healthy
+    volumes:
+      - ./nginx-chrome.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - goclaw-internal
+    restart: unless-stopped
+
+  vnc:
+    image: dorowu/ubuntu-desktop-lxde-vnc
+    environment:
+      - RESOLUTION=1280x720x24
+      - VNC_PASSWORD=${VNC_PASSWORD:-goclaw}
+    ports:
+      - "6080:80"     # noVNC - mở browser vào đây để xem màn hình
+      - "5900:5900"   # VNC client
+    volumes:
+      - x11-socket:/tmp/.X11-unix
+    networks:
+      - goclaw-internal
+    shm_size: 512m
+    restart: unless-stopped
+
+  goclaw:
+    # Image dựng sẵn trên Docker Hub, kéo nhanh hơn ghcr.io đáng kể. Đã có sẵn
+    # psql 18, xdotool/scrot/xdpyinfo và claude CLI nên không cần build local.
+    image: ${GOCLAW_IMAGE:-thotam/goclaw:beta-full}
+    depends_on:
+      goclaw-db:
+        condition: service_healthy
+      chrome-proxy:
+        condition: service_started
+      vnc:
+        condition: service_started   # thêm dòng này
+    ports:
+      - "${GOCLAW_PORT:-18790}:18790"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - GOCLAW_HOST=0.0.0.0
+      - GOCLAW_PORT=18790
+      - GOCLAW_CONFIG=/app/data/config.json
+      - GOCLAW_GATEWAY_TOKEN=${GOCLAW_GATEWAY_TOKEN:-}
+      - GOCLAW_ENCRYPTION_KEY=${GOCLAW_ENCRYPTION_KEY:-}
+      - GOCLAW_SKILLS_DIR=/app/data/skills
+      - GOCLAW_TRACE_VERBOSE=${GOCLAW_TRACE_VERBOSE:-0}
+      - GOCLAW_BROWSER_REMOTE_URL=ws://chrome-proxy:9222
+      # Dùng hostname goclaw-db thay vì postgres để tránh DNS conflict
+      - GOCLAW_POSTGRES_DSN=postgres://${POSTGRES_USER:-goclaw}:${POSTGRES_PASSWORD:-goclaw}@goclaw-db:5432/${POSTGRES_DB:-goclaw}?sslmode=disable
+      - DISPLAY=:1   # kết nối vào X display của VNC container
+    volumes:
+      - goclaw-data:/app/data
+      - goclaw-workspace:/app/workspace
+      - goclaw-skills:/app/skills
+      - goclaw-workspace:/app/.goclaw
+      - /root/.claude:/app/.claude-host:ro
+      - x11-socket:/tmp/.X11-unix   # chia sẻ X11 socket
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+      - KILL
+    tmpfs:
+      - /tmp:rw,nosuid,size=256m
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '2.0'
+          pids: 200
+    networks:
+      - goclaw-internal   # giao tiếp với goclaw-db
+      - baota_net         # expose ra ngoài qua aaPanel
+    restart: unless-stopped
+
+volumes:
+  goclaw-data:
+  goclaw-workspace:
+  postgres-data:
+  goclaw-skills:
+  x11-socket:
+
+networks:
+  goclaw-internal:
+    driver: bridge      # network nội bộ riêng, tránh conflict DNS
+  baota_net:
+    external: true

@@ -89,8 +89,14 @@ COPY docker/requirements-base.txt docker/requirements-skills.txt /tmp/
 # two binaries the media budget guard measures with. Without them read_video and read_audio
 # refuse the call and read_document falls back to the provider's 1000-page ceiling.
 # poppler-utils is skipped here when ENABLE_FULL_SKILLS already installs it below.
+#
+# Fork addition: postgresql18-client gives agents a psql matching the PG18 server,
+# and xdotool/scrot/xdpyinfo drive the X display shared from the VNC sidecar in
+# docker-compose.yaml. All four come from the v3.23 stable repositories, so no
+# edge repository is mixed in. See DEPLOY.md.
 RUN set -eux; \
     apk add --no-cache ca-certificates wget su-exec tzdata; \
+    apk add --no-cache postgresql18-client xdotool scrot xdpyinfo; \
     if [ "$ENABLE_MEDIA_PROBES" = "true" ]; then \
         apk add --no-cache ffmpeg; \
         if [ "$ENABLE_FULL_SKILLS" != "true" ]; then \
