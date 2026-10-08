@@ -154,5 +154,6 @@ jobs:
             ENABLE_FULL_SKILLS=${{ matrix.enable_full_skills }}
             ENABLE_MEDIA_PROBES=${{ matrix.enable_media_probes }}
             VERSION=${{ github.ref_name }}
+            COMMIT_SHA=${{ github.sha }}
           cache-from: type=gha,scope=beta-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=beta-${{ matrix.variant }}

@@ -29,7 +29,7 @@ func doctorCmd() *cobra.Command {
 
 func runDoctor() {
 	fmt.Println("goclaw doctor")
-	fmt.Printf("  Version:  %s (protocol %d)\n", Version, protocol.ProtocolVersion)
+	fmt.Printf("  Version:  %s%s (protocol %d)\n", Version, commitSuffix(), protocol.ProtocolVersion)
 	fmt.Printf("  OS:       %s/%s\n", runtime.GOOS, runtime.GOARCH)
 	fmt.Printf("  Go:       %s\n", runtime.Version())
 	fmt.Println()

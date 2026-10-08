@@ -41,6 +41,7 @@ ARG ENABLE_TSNET=false
 ARG ENABLE_REDIS=false
 ARG ENABLE_EMBEDUI=false
 ARG VERSION=
+ARG COMMIT_SHA=
 
 # Copy web UI dist — from web-builder when ENABLE_EMBEDUI=true, empty dir otherwise.
 COPY --from=web-dist /app/dist /src/internal/webui/dist
@@ -48,6 +49,7 @@ COPY --from=web-dist /app/dist /src/internal/webui/dist
 RUN set -eux; \
     if [ -z "$VERSION" ] && [ -f VERSION ]; then VERSION=$(cat VERSION); fi; \
     if [ -z "$VERSION" ]; then VERSION="dev"; fi; \
+    if [ -z "$COMMIT_SHA" ]; then COMMIT_SHA="unknown"; fi; \
     TAGS=""; \
     if [ "$ENABLE_EMBEDUI" = "true" ]; then TAGS="embedui"; fi; \
     if [ "$ENABLE_OTEL" = "true" ]; then \
@@ -61,7 +63,7 @@ RUN set -eux; \
     fi; \
     if [ -n "$TAGS" ]; then TAGS="-tags $TAGS"; fi; \
     CGO_ENABLED=0 GOOS=linux \
-    go build -ldflags="-s -w -X github.com/nextlevelbuilder/goclaw/cmd.Version=${VERSION}" \
+    go build -ldflags="-s -w -X github.com/nextlevelbuilder/goclaw/cmd.Version=${VERSION} -X github.com/nextlevelbuilder/goclaw/cmd.CommitSHA=${COMMIT_SHA}" \
     ${TAGS} -o /out/goclaw . && \
     CGO_ENABLED=0 GOOS=linux \
     go build -ldflags="-s -w" -o /out/pkg-helper ./cmd/pkg-helper

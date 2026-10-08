@@ -159,6 +159,7 @@ func TestAnthropicAdapterToRequest_SkipsTemperatureForClaude46AndNewer(t *testin
 		"claude-opus-4-7-20260501",
 		"claude-opus-5",
 		"claude-sonnet-5",
+		"claude-sonnet-5-5",
 	} {
 		t.Run(model, func(t *testing.T) {
 			req := ChatRequest{
@@ -198,6 +199,114 @@ func TestAnthropicAdapterToRequest_SkipsTemperatureForClaude46AndNewer(t *testin
 	}
 }
 
+func TestAnthropicAdapterToRequest_AdaptiveThinkingForSonnet55(t *testing.T) {
+	adapter, _ := NewAnthropicAdapter(ProviderConfig{APIKey: "sk-test"})
+
+	req := ChatRequest{
+		Model:    "claude-sonnet-5-5",
+		Messages: []Message{{Role: "user", Content: "Think about this"}},
+		Options: map[string]any{
+			OptThinkingLevel: "high",
+			OptTemperature:   0.7,
+		},
+	}
+	data, headers, err := adapter.ToRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headers.Get("anthropic-beta") != "" {
+		t.Errorf("adaptive thinking should not send anthropic-beta, got %q", headers.Get("anthropic-beta"))
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatal(err)
+	}
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok {
+		t.Fatal("expected thinking config in body")
+	}
+	if thinking["type"] != "adaptive" {
+		t.Errorf("thinking type = %v, want adaptive", thinking["type"])
+	}
+	if thinking["display"] != "summarized" {
+		t.Errorf("thinking display = %v, want summarized", thinking["display"])
+	}
+	if _, hasBudget := thinking["budget_tokens"]; hasBudget {
+		t.Error("adaptive thinking should not set budget_tokens")
+	}
+	output, ok := body["output_config"].(map[string]any)
+	if !ok || output["effort"] != "high" {
+		t.Errorf("output_config = %v, want effort=high", body["output_config"])
+	}
+	if _, hasTemp := body["temperature"]; hasTemp {
+		t.Error("temperature should be omitted for claude-sonnet-5-5")
+	}
+}
+
+func TestAnthropicAdapterToRequest_AdaptiveThinkingOmitsDisplayWhenStripped(t *testing.T) {
+	adapter, _ := NewAnthropicAdapter(ProviderConfig{APIKey: "sk-test"})
+
+	req := ChatRequest{
+		Model:    "claude-sonnet-5-5",
+		Messages: []Message{{Role: "user", Content: "Think about this"}},
+		Options: map[string]any{
+			OptThinkingLevel: "high",
+			OptStripThinking: true,
+		},
+	}
+	data, _, err := adapter.ToRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatal(err)
+	}
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok {
+		t.Fatal("expected thinking config in body")
+	}
+	if thinking["display"] != "omitted" {
+		t.Errorf("thinking display = %v, want omitted", thinking["display"])
+	}
+}
+
+func TestAnthropicAdapterToRequest_DatedSonnet4KeepsManualThinking(t *testing.T) {
+	adapter, _ := NewAnthropicAdapter(ProviderConfig{APIKey: "sk-test"})
+
+	req := ChatRequest{
+		Model:    "claude-sonnet-4-20250514",
+		Messages: []Message{{Role: "user", Content: "Think about this"}},
+		Options:  map[string]any{OptThinkingLevel: "high"},
+	}
+	data, headers, err := adapter.ToRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headers.Get("anthropic-beta") == "" {
+		t.Error("manual thinking should send the interleaved-thinking beta header")
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatal(err)
+	}
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok {
+		t.Fatal("expected thinking config in body")
+	}
+	if thinking["type"] != "enabled" {
+		t.Errorf("thinking type = %v, want enabled", thinking["type"])
+	}
+	if _, hasDisplay := thinking["display"]; hasDisplay {
+		t.Errorf("manual thinking should not set display, got %v", thinking["display"])
+	}
+	budget, _ := thinking["budget_tokens"].(float64)
+	if int(budget) != 32000 {
+		t.Errorf("thinking budget = %v, want 32000", budget)
+	}
+}
+
 func TestAnthropicAdapterFromResponse_ToolCalls(t *testing.T) {
 	adapter, _ := NewAnthropicAdapter(ProviderConfig{APIKey: "sk-test"})
 
@@ -229,6 +338,44 @@ func TestAnthropicAdapterFromResponse_ToolCalls(t *testing.T) {
 	}
 	if resp.Usage.PromptTokens != 100 {
 		t.Errorf("PromptTokens = %d", resp.Usage.PromptTokens)
+	}
+}
+
+func TestAnthropicAdapterFromResponse_EmptyThinkingFieldPreserved(t *testing.T) {
+	adapter, _ := NewAnthropicAdapter(ProviderConfig{APIKey: "sk-test"})
+
+	respJSON := `{
+		"content": [
+			{"type": "thinking", "thinking": "", "signature": "sig-empty"},
+			{"type": "tool_use", "id": "toolu_01", "name": "heartbeat_ok", "input": {}}
+		],
+		"stop_reason": "tool_use",
+		"usage": {"input_tokens": 10, "output_tokens": 5}
+	}`
+
+	resp, err := adapter.FromResponse([]byte(respJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.RawAssistantContent == nil {
+		t.Fatal("expected RawAssistantContent for tool passback")
+	}
+	var blocks []map[string]any
+	if err := json.Unmarshal(resp.RawAssistantContent, &blocks); err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("blocks = %d, want 2", len(blocks))
+	}
+	thinking, ok := blocks[0]["thinking"]
+	if !ok {
+		t.Fatal("thinking field was dropped; Anthropic requires it even when empty")
+	}
+	if thinking != "" {
+		t.Errorf("thinking = %v, want empty string", thinking)
+	}
+	if blocks[0]["signature"] != "sig-empty" {
+		t.Errorf("signature = %v, want sig-empty", blocks[0]["signature"])
 	}
 }
 
